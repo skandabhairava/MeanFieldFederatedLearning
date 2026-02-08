@@ -1,18 +1,15 @@
-import copy
-import logging as log
-
-import numpy as np
 import ray
 import torch
-import torch.nn.functional as F
+import numpy as np
 from torch import optim
-from torch.utils.data import DataLoader, Dataset
+import torch.nn.functional as F
+from torch.utils.data import Dataset
 
-import models
-import attacks
-import config
-from data import ClientSplit
 import data
+import models
+import config
+import attacks
+from data import ClientSplit
 
 class Client:
     def __init__(self, cid: int, splits: list[ClientSplit], client_type="normal"):
@@ -21,7 +18,7 @@ class Client:
         self.client_type = client_type
         # self.batch_size = batch_size
 
-        if client_type == "byzantine":
+        if client_type == "byzantine_flip":
             self.attack = attacks.ByzantineFlip("flip")
         else:
             self.attack = None
@@ -62,6 +59,7 @@ def train(global_sd: models.StateDict, split: ClientSplit, dataset: Dataset, bat
             opt.step()
 
     new_sd = model.state_dict()
+    new_sd = {k: v.cpu() for k, v in new_sd.items()}
 
     if attack is not None:
         # convert to update space, manipulate, then reconstruct
@@ -69,8 +67,6 @@ def train(global_sd: models.StateDict, split: ClientSplit, dataset: Dataset, bat
             delta = new_sd[k] - global_sd[k]
             delta = attack.manipulate_update(delta)
             new_sd[k] = global_sd[k] + delta
-
-    new_sd = {k: v.cpu() for k, v in new_sd.items()}
 
     return new_sd # pyright: ignore[reportReturnType]
 

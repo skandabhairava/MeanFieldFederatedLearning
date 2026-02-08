@@ -1,10 +1,6 @@
 import logging as log
-# import pickle
-import time
 
 import os
-import numpy as np
-# import torch
 import ray
 
 import lib
@@ -42,7 +38,7 @@ def main():
     server = Server(model, clients, config.RANDOM_SEED)
 
     log.info("Starting Training")
-    history = server.train(combined_data)
+    server.train(combined_data, "20_byzantine_flip")
 
 
 if __name__ == "__main__":

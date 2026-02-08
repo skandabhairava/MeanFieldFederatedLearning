@@ -1,8 +1,9 @@
+from collections import OrderedDict
+
 import torch
 import torch.nn as nn
-import torchvision.models as models
 
-from collections import OrderedDict
+
 type StateDict = OrderedDict[str, torch.Tensor]
 
 class SimpleCNN(nn.Module):

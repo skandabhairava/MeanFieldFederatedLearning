@@ -1,10 +1,9 @@
-# from collections import Counter
 import logging as log
 
-import numpy as np
 import torch
-from torch.utils.data import Subset, DataLoader, Dataset
+import numpy as np
 from torchvision import datasets, transforms
+from torch.utils.data import Subset, DataLoader, Dataset
 
 from stats import avg
 

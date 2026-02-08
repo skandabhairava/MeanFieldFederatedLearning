@@ -22,8 +22,8 @@ NUM_GPUS = 1
 
 # client typing
 CLIENT_TYPES = {
-    "normal": 1.0,
-    "byzantine": 0.0,
+    "normal": 0.8,
+    "byzantine_flip": 0.2,
 }
 
 RANDOM_SEED = 60123

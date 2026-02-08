@@ -1,9 +1,9 @@
 import os
 import random
+import logging as log
 
 import torch
 import numpy as np
-import logging as log
 
 def set_log_level(level: int):
     logger = log.getLogger()

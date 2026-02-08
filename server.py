@@ -1,16 +1,16 @@
-import random
+import gc
+import os
 import copy
+import time
+import pickle
+import random
 import logging as log
 from dataclasses import dataclass, asdict
-import time
-import os
-import pickle
-import gc
 
-import torch
-from torch.utils.data import Dataset
 import ray
+import torch
 import numpy as np
+from torch.utils.data import Dataset
 
 import stats
 import config
@@ -57,12 +57,13 @@ class Server:
     def project(self, vec: torch.Tensor) -> np.ndarray:
         return (vec @ self.R).numpy()
 
-    def train(self, dataset: Dataset):
+    def train(self, dataset: Dataset, name_suffix: str=''):
         # history = []
+        name_suffix = '_' + name_suffix if name_suffix else ''
 
         run_id = time.asctime().replace(" ", "_").replace(":", "-")
 
-        os.makedirs(f"{config.LOG_DIR}/RUN_{run_id}", exist_ok=True)
+        os.makedirs(f"{config.LOG_DIR}/RUN_{run_id}{name_suffix}", exist_ok=True)
 
         dataset_ref = ray.put(dataset)
         batch_size = ray.put(config.BATCH_SIZE)
@@ -70,15 +71,15 @@ class Server:
 
         for r in range(config.ROUNDS):
             log.info(f"{r+1}/{config.ROUNDS}: ")
-            client_accs = self.round(r, run_id, dataset_ref, batch_size, device)
+            client_accs = self.round(r, run_id, dataset_ref, batch_size, device, name_suffix)
             # history.append(asdict(res))
             
-            with open(f"{config.LOG_DIR}/RUN_{run_id}/round_{r}.npy", "rb") as f:
+            with open(f"{config.LOG_DIR}/RUN_{run_id}{name_suffix}/round_{r}.npy", "rb") as f:
                 data = pickle.load(f)
 
             data["client_accs"] = client_accs
 
-            with open(f"{config.LOG_DIR}/RUN_{run_id}/round_{r}.npy", "wb") as f:
+            with open(f"{config.LOG_DIR}/RUN_{run_id}{name_suffix}/round_{r}.npy", "wb") as f:
                 pickle.dump(data, f)
 
             acc = stats.avg(client_accs)
@@ -87,7 +88,7 @@ class Server:
         # return history
 
 
-    def round(self, r, run_id, dataset_ref: Dataset, batch_size, device) -> list[float]:
+    def round(self, r, run_id, dataset_ref: Dataset, batch_size, device, name_suffix: str) -> list[float]:
         m = int(len(self.clients) * config.CLIENT_FRAC)
         selected = random.sample(self.clients, m)
 
@@ -132,7 +133,7 @@ class Server:
             proj_weights
         )
 
-        with open(f"{config.LOG_DIR}/RUN_{run_id}/round_{r}.npy", "wb") as f:
+        with open(f"{config.LOG_DIR}/RUN_{run_id}{name_suffix}/round_{r}.npy", "wb") as f:
             pickle.dump(asdict(res), f)
 
         del res
