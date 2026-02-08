@@ -1,1 +1,4 @@
 .venv
+logs
+data
+__pycache__
