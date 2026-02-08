@@ -1,4 +1,5 @@
 import copy
+import logging as log
 
 import numpy as np
 import ray
@@ -10,27 +11,27 @@ from torch.utils.data import DataLoader, Dataset
 import models
 import attacks
 import config
-from data import ClientSplits
+from data import ClientSplit
 import data
 
 class Client:
-    def __init__(self, cid: int, splits: ClientSplits, combined_dataset: Dataset, batch_size: int, client_type="normal"):
+    def __init__(self, cid: int, splits: list[ClientSplit], client_type="normal"):
         self.cid = cid
-        self.splits = splits
-        self.dataset = combined_dataset
+        self.split = splits[cid]
         self.client_type = client_type
-        self.batch_size = batch_size
+        # self.batch_size = batch_size
 
         if client_type == "byzantine":
             self.attack = attacks.ByzantineFlip("flip")
         else:
             self.attack = None
 
-    def train(self, global_sd: models.StateDict):
-        return train.remote(self.cid, global_sd, self.splits, self.dataset, self.batch_size, config.DEVICE, self.attack)
+    def train(self, global_sd: models.StateDict, dataset: Dataset, batch_size, device):
+        return train.remote(global_sd, self.split, dataset, batch_size, device, self.attack)
 
-    def evaluate(self, global_sd: models.StateDict):
-        return evaluate.remote(self.cid, global_sd, self.splits, self.dataset, self.batch_size, config.DEVICE)
+    def evaluate(self, global_sd: models.StateDict, dataset: Dataset, batch_size, device):
+        return evaluate.remote(global_sd, self.split, dataset, batch_size, device)
+        # return evaluate(self.cid, global_sd, self.split, dataset, self.batch_size, config.DEVICE)
 
     @staticmethod    
     def sample_types(n, proportions: dict[str, float]):
@@ -41,7 +42,7 @@ class Client:
         return list(np.random.choice(names, size=n, p=probs))
     
 @ray.remote(num_cpus=2, num_gpus=0.5)
-def train(cid: int, global_sd: models.StateDict, splits: ClientSplits, dataset: Dataset, batch_size: int, device: str|torch.device, attack: None|attacks.Attack) -> models.StateDict:
+def train(global_sd: models.StateDict, split: ClientSplit, dataset: Dataset, batch_size: int, device: str|torch.device, attack: None|attacks.Attack) -> models.StateDict:
     model = models.get_model().to(device)
     model.load_state_dict(global_sd)
 
@@ -51,7 +52,7 @@ def train(cid: int, global_sd: models.StateDict, splits: ClientSplits, dataset: 
     # x: torch.Tensor
     # y: torch.Tensor
 
-    train_loader = data.build_client_loaders(dataset, cid, splits, batch_size, True)
+    train_loader = data.build_client_loaders(dataset, split, batch_size, True)
     for _ in range(config.LOCAL_EPOCHS):
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
@@ -74,20 +75,24 @@ def train(cid: int, global_sd: models.StateDict, splits: ClientSplits, dataset: 
     return new_sd # pyright: ignore[reportReturnType]
 
 @ray.remote(num_cpus=2, num_gpus=0.5)
-def evaluate(cid: int, global_sd: models.StateDict, splits: ClientSplits, dataset: Dataset, batch_size: int, device: str|torch.device) -> float:
+def evaluate(global_sd: models.StateDict, splits: ClientSplit, dataset: Dataset, batch_size: int, device: str|torch.device) -> float:
     # x: torch.Tensor
     # y: torch.Tensor
 
     correct, total = 0, 0
 
-    test_loader = data.build_client_loaders(dataset, cid, splits, batch_size, False)
+    test_loader = data.build_client_loaders(dataset, splits, batch_size, False)
+
+    # log.info(f"loaded test loader for client: {cid}")
 
     model = models.get_model().to(device)
     model.load_state_dict(global_sd)
     model.eval()
 
     with torch.no_grad():
-        for x, y in test_loader:
+        # log.info(f"\tLoaded model for cid: {cid}")
+        for i, (x, y) in enumerate(test_loader):
+            # log.info(f"\t\t{i} for cid: {cid}")
             x, y = x.to(device), y.to(device)
             pred = model(x).argmax(1)
             correct += (pred == y).sum().item()

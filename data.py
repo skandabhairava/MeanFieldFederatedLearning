@@ -1,12 +1,14 @@
 # from collections import Counter
-# import logging as log
+import logging as log
 
 import numpy as np
 import torch
 from torch.utils.data import Subset, DataLoader, Dataset
 from torchvision import datasets, transforms
 
-type ClientSplits = list[tuple[list[int], list[int]]]
+from stats import avg
+
+type ClientSplit = tuple[list[int], list[int]]
 
 def get_datasets():
     tfm = transforms.Compose([transforms.ToTensor()])
@@ -63,13 +65,13 @@ def generate_client_splits(
     n_clients: int,
     alpha: float,
     train_test_split_ratio: float = 0.8,
-) -> tuple[ClientSplits, Dataset]:
+) -> tuple[list[ClientSplit], Dataset]:
     train, test = get_datasets()
 
     combined_targets = get_combined_targets(train, test)
     client_all = dirichlet_split(combined_targets, n_clients, alpha)
 
-    client_splits: ClientSplits = []
+    client_splits: list[ClientSplit] = []
 
     for client_id in range(n_clients):
         idxs = np.array(client_all[client_id])
@@ -88,10 +90,13 @@ def generate_client_splits(
 
         client_splits.append((train_idx, test_idx))
 
+    train_avg = avg(len(client[0]) for client in client_splits)
+    test_avg = avg(len(client[1]) for client in client_splits)
+    log.info(f"{train_avg=} || {test_avg=}")
     return client_splits, torch.utils.data.ConcatDataset([train, test])
 
-def build_client_loaders(combined: Dataset, client_id: int, splits: ClientSplits, batch_size: int, load_train: bool):
-    train_idx, test_idx = splits[client_id]
+def build_client_loaders(combined: Dataset, split: ClientSplit, batch_size: int, load_train: bool):
+    train_idx, test_idx = split
 
     if load_train:
         loader = DataLoader(

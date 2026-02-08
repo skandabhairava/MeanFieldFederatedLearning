@@ -5,8 +5,10 @@ from dataclasses import dataclass, asdict
 import time
 import os
 import pickle
+import gc
 
 import torch
+from torch.utils.data import Dataset
 import ray
 import numpy as np
 
@@ -29,7 +31,7 @@ class Server:
         self.model = model
         self.clients = clients
 
-        self.proj_dim = 50
+        self.proj_dim = 200
 
         log.debug("starting server...")
         D = sum(p.numel() for p in self.model.state_dict().values())
@@ -55,33 +57,45 @@ class Server:
     def project(self, vec: torch.Tensor) -> np.ndarray:
         return (vec @ self.R).numpy()
 
-    def train(self):
+    def train(self, dataset: Dataset):
         # history = []
 
         run_id = time.asctime().replace(" ", "_").replace(":", "-")
 
         os.makedirs(f"{config.LOG_DIR}/RUN_{run_id}", exist_ok=True)
 
+        dataset_ref = ray.put(dataset)
+        batch_size = ray.put(config.BATCH_SIZE)
+        device = ray.put(config.DEVICE)
+
         for r in range(config.ROUNDS):
             log.info(f"{r+1}/{config.ROUNDS}: ")
-            res = self.round(r)
+            client_accs = self.round(r, run_id, dataset_ref, batch_size, device)
             # history.append(asdict(res))
-            with open(f"{config.LOG_DIR}/RUN_{run_id}/round_{r}.npy", "wb") as f:
-                pickle.dump(asdict(res), f)
             
-            acc = sum(res.client_accs)/len(res.client_accs)
+            with open(f"{config.LOG_DIR}/RUN_{run_id}/round_{r}.npy", "rb") as f:
+                data = pickle.load(f)
+
+            data["client_accs"] = client_accs
+
+            with open(f"{config.LOG_DIR}/RUN_{run_id}/round_{r}.npy", "wb") as f:
+                pickle.dump(data, f)
+
+            acc = stats.avg(client_accs)
             log.info(f"\tAccuracy: {acc*100:.2f}%")
 
         # return history
 
 
-    def round(self, r) -> RoundResults:
+    def round(self, r, run_id, dataset_ref: Dataset, batch_size, device) -> list[float]:
         m = int(len(self.clients) * config.CLIENT_FRAC)
         selected = random.sample(self.clients, m)
 
         global_sd: models.StateDict = self.model.state_dict() # pyright: ignore[reportAssignmentType]
 
-        futures = [c.train(global_sd) for c in selected]
+        global_sd_ref = ray.put(global_sd)
+
+        futures = [c.train(global_sd_ref, dataset_ref, batch_size, device) for c in selected]
         local_sds = ray.get(futures)
 
         raw_updates = []
@@ -91,6 +105,8 @@ class Server:
         # calc deltas of each local_update since last round
         g = stats.flatten(global_sd)
 
+        del global_sd_ref
+
         for sd in local_sds:
             flat_local = stats.flatten(sd)
             delta = (flat_local - g).cpu()
@@ -99,7 +115,7 @@ class Server:
             proj_updates.append(self.project(delta))
             proj_weights.append(self.project(flat_local))
 
-        log.info("calcing stats.")
+        log.debug("calcing stats.")
 
         st = stats.mean_var(raw_updates)
         cos = stats.cosine(raw_updates)
@@ -107,17 +123,33 @@ class Server:
         new_global = self.aggregate(local_sds)
         self.model.load_state_dict(new_global)
 
-        log.info("Finished training. Starting Eval")
-
-        accs = ray.get([c.evaluate(new_global) for c in self.clients])
-
-        log.info("finished. returning round data")
-
-        return RoundResults(
+        res = RoundResults(
             r,
             st,
             cos,
-            accs,
+            [],
             proj_updates,
             proj_weights
         )
+
+        with open(f"{config.LOG_DIR}/RUN_{run_id}/round_{r}.npy", "wb") as f:
+            pickle.dump(asdict(res), f)
+
+        del res
+        del st
+        del cos
+        del proj_updates
+        del proj_weights
+        del local_sds
+        gc.collect()
+
+        global_sd_ref = ray.put(new_global)
+
+        log.debug("Finished training. Starting Eval")
+
+        accs = ray.get([c.evaluate(global_sd_ref, dataset_ref, batch_size, device) for c in self.clients])
+        # accs = [c.evaluate(new_global, dataset) for c in self.clients]
+
+        log.debug("finished. returning round data")
+
+        return accs

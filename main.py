@@ -29,7 +29,7 @@ def main():
     log.debug(f"Sampled clients: {types}")
 
     clients = [
-        Client(i, client_splits, combined_data, config.BATCH_SIZE, types[i])
+        Client(i, client_splits, types[i])
         for i in range(config.NUM_CLIENTS)
     ]
 
@@ -42,7 +42,7 @@ def main():
     server = Server(model, clients, config.RANDOM_SEED)
 
     log.info("Starting Training")
-    history = server.train()
+    history = server.train(combined_data)
 
 
 if __name__ == "__main__":
