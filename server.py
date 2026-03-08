@@ -16,6 +16,7 @@ import stats
 import config
 import client
 import models
+import attacks
 
 @dataclass
 class RoundResults:
@@ -64,6 +65,11 @@ class Server:
         run_id = time.asctime().replace(" ", "_").replace(":", "-")
 
         os.makedirs(f"{config.LOG_DIR}/RUN_{run_id}{name_suffix}", exist_ok=True)
+
+        for c in self.clients:
+            for attack_type in attacks.attacks_to_prepare:
+                if c.attack is not None and isinstance(c.attack, attack_type):
+                    c.attack.prepare(self.model.state_dict()) # pyright: ignore[reportArgumentType]
 
         dataset_ref = ray.put(dataset)
         batch_size = ray.put(config.BATCH_SIZE)

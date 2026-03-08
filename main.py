@@ -25,7 +25,7 @@ def main():
     log.debug(f"Sampled clients: {types}")
 
     clients = [
-        Client(i, client_splits, types[i])
+        Client(i, client_splits, types[i], seed=config.RANDOM_SEED)
         for i in range(config.NUM_CLIENTS)
     ]
 
