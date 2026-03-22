@@ -1,6 +1,6 @@
 import gc
 import os
-import copy
+from typing import Sequence
 import time
 import pickle
 import random
@@ -18,14 +18,16 @@ import client
 import models
 import attacks
 
+ModelState = tuple[models.StateDict, int]
+
 @dataclass
 class RoundResults:
-    round: int
-    stats: dict[str, int|float]
-    cosine: np.ndarray
+    round_id: int
+    selected_clients: list[int]
     client_accs: list[float]
-    proj_updates: list[np.ndarray]
-    proj_weights: list[np.ndarray]
+    delta_proj: list[np.ndarray]
+    global_post_train_proj: np.ndarray
+    debug_client_types: list[str]
 
 class Server:
     def __init__(self, model: torch.nn.Module, clients: list[client.Client], seed: int):
@@ -47,13 +49,30 @@ class Server:
         log.debug("finished initing server")
 
     # FedAVG
-    def aggregate(self, states: list[models.StateDict]):
-        new = copy.deepcopy(states[0])
-        for k in new:
-            for i in range(1, len(states)):
-                new[k] += states[i][k]
-            new[k] /= len(states)
-        return new
+    # def aggregate(self, states: list[models.StateDict]):
+    #     new = copy.deepcopy(states[0])
+    #     for k in new:
+    #         for i in range(1, len(states)):
+    #             new[k] += states[i][k]
+    #         new[k] /= len(states)
+    #     return new
+    
+    # FedAVG
+    def aggregate(self, client_weights: Sequence[ModelState]) -> ModelState:
+        # total all of weights
+        total = 0
+        for i in range(len(client_weights)):
+            total += client_weights[i][1]
+        
+        global_weights = client_weights[0][0]
+        for key in global_weights.keys(): # for each param in clients
+            for i in range(len(client_weights)): # for each client
+                if i == 0: # scale global_wights(client i == 0)'s by itself
+                    global_weights[key] = (client_weights[0][1] / total) * global_weights[key]
+                else: # add a scaled value to the avg/global weight client
+                    w = client_weights[i][1] / total
+                    global_weights[key] = global_weights[key] + w * client_weights[i][0][key]
+        return global_weights, total
     
     def project(self, vec: torch.Tensor) -> np.ndarray:
         return (vec @ self.R).numpy()
@@ -75,18 +94,11 @@ class Server:
         batch_size = ray.put(config.BATCH_SIZE)
         device = ray.put(config.DEVICE)
 
-        for r in range(config.ROUNDS):
-            log.info(f"{r+1}/{config.ROUNDS}: ")
-            client_accs = self.round(r, run_id, dataset_ref, batch_size, device, name_suffix)
+        for round_id in range(1, config.ROUNDS+1):
+            log.info(f"{round_id}/{config.ROUNDS+1}: ")
+            client_accs = self.round(round_id, run_id, dataset_ref, batch_size, device, name_suffix)
+                            # self.round writes updates to disk ^^
             # history.append(asdict(res))
-            
-            with open(f"{config.LOG_DIR}/RUN_{run_id}{name_suffix}/round_{r}.npy", "rb") as f:
-                data = pickle.load(f)
-
-            data["client_accs"] = client_accs
-
-            with open(f"{config.LOG_DIR}/RUN_{run_id}{name_suffix}/round_{r}.npy", "wb") as f:
-                pickle.dump(data, f)
 
             acc = stats.avg(client_accs)
             log.info(f"\tAccuracy: {acc*100:.2f}%")
@@ -94,7 +106,7 @@ class Server:
         # return history
 
 
-    def round(self, r, run_id, dataset_ref: Dataset, batch_size, device, name_suffix: str) -> list[float]:
+    def round(self, round_id, run_id, dataset_ref: Dataset, batch_size, device, name_suffix: str) -> list[float]:
         m = int(len(self.clients) * config.CLIENT_FRAC)
         selected = random.sample(self.clients, m)
 
@@ -103,10 +115,12 @@ class Server:
         global_sd_ref = ray.put(global_sd)
 
         futures = [c.train(global_sd_ref, dataset_ref, batch_size, device) for c in selected]
-        local_sds = ray.get(futures)
+        local_sds__cid = ray.get(futures)
+        local_sds__cid.sort(key=lambda x: x[1])
 
-        raw_updates = []
-        proj_weights: list[np.ndarray] = []
+        local_sds: tuple[ModelState, ...]
+        local_sds, cid = zip(*local_sds__cid)
+
         proj_updates: list[np.ndarray] = []
 
         # calc deltas of each local_update since last round
@@ -114,39 +128,38 @@ class Server:
 
         del global_sd_ref
 
-        for sd in local_sds:
+        for sd, _total in local_sds:
             flat_local = stats.flatten(sd)
             delta = (flat_local - g).cpu()
             
-            raw_updates.append(delta)
             proj_updates.append(self.project(delta))
-            proj_weights.append(self.project(flat_local))
 
         log.debug("calcing stats.")
 
-        st = stats.mean_var(raw_updates)
-        cos = stats.cosine(raw_updates)
-
         new_global = self.aggregate(local_sds)
-        self.model.load_state_dict(new_global)
+        self.model.load_state_dict(new_global[0])
+
+        client_types__selected = [(c.client_type, c.cid) for c in selected]
+        client_types__selected.sort(key=lambda x: x[1])
+
+        client_types, selected_id = zip(*client_types__selected)
+        client_types_: list[str] = list(client_types)
+        selected_id_: list[int] = list(selected_id)
 
         res = RoundResults(
-            r,
-            st,
-            cos,
+            round_id,
+            selected_id_,
             [],
             proj_updates,
-            proj_weights
+            self.project(stats.flatten(new_global[0])),
+            client_types_
         )
 
-        with open(f"{config.LOG_DIR}/RUN_{run_id}{name_suffix}/round_{r}.npy", "wb") as f:
+        with open(f"{config.LOG_DIR}/RUN_{run_id}{name_suffix}/round_{round_id}.npy", "wb") as f:
             pickle.dump(asdict(res), f)
 
         del res
-        del st
-        del cos
         del proj_updates
-        del proj_weights
         del local_sds
         gc.collect()
 
@@ -157,6 +170,17 @@ class Server:
         accs = ray.get([c.evaluate(global_sd_ref, dataset_ref, batch_size, device) for c in self.clients])
         # accs = [c.evaluate(new_global, dataset) for c in self.clients]
 
-        log.debug("finished. returning round data")
+        accs.sort(key=lambda x: x[1])
+        accs_, _ = zip(*accs)
 
-        return accs
+        accs_lis = list(accs_)
+
+        with open(f"{config.LOG_DIR}/RUN_{run_id}{name_suffix}/round_{round_id}.npy", "rb") as f:
+            data = pickle.load(f)
+
+        data["client_accs"] = accs_lis
+
+        with open(f"{config.LOG_DIR}/RUN_{run_id}{name_suffix}/round_{round_id}.npy", "wb") as f:
+            pickle.dump(data, f)
+
+        return accs_lis

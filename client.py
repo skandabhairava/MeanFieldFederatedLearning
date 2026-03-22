@@ -11,6 +11,8 @@ import config
 import attacks
 from data import ClientSplit
 
+ModelState = tuple[models.StateDict, int]
+
 class Client:
     def __init__(self, cid: int, splits: list[ClientSplit], client_type="normal", seed=42):
         self.cid = cid
@@ -44,10 +46,10 @@ class Client:
             self.attack = attacks.SybilAttack2("sybil_attack2")
 
     def train(self, global_sd: models.StateDict, dataset: Dataset, batch_size, device):
-        return train.remote(global_sd, self.split, dataset, batch_size, device, self.attack)
+        return train.remote(global_sd, self.split, dataset, batch_size, device, self.attack, self.cid)
 
     def evaluate(self, global_sd: models.StateDict, dataset: Dataset, batch_size, device):
-        return evaluate.remote(global_sd, self.split, dataset, batch_size, device)
+        return evaluate.remote(global_sd, self.split, dataset, batch_size, device, self.cid)
         # return evaluate(self.cid, global_sd, self.split, dataset, self.batch_size, config.DEVICE)
 
     @staticmethod    
@@ -59,7 +61,7 @@ class Client:
         return list(np.random.choice(names, size=n, p=probs))
     
 @ray.remote(num_cpus=2, num_gpus=0.5)
-def train(global_sd: models.StateDict, split: ClientSplit, dataset: Dataset, batch_size: int, device: str|torch.device, attack: None|attacks.Attack) -> models.StateDict:
+def train(global_sd: models.StateDict, split: ClientSplit, dataset: Dataset, batch_size: int, device: str|torch.device, attack: None|attacks.Attack, cid: int) -> tuple[ModelState, int]:
     model = models.get_model().to(device)
     model.load_state_dict(global_sd)
 
@@ -88,10 +90,10 @@ def train(global_sd: models.StateDict, split: ClientSplit, dataset: Dataset, bat
             delta = attack.manipulate_update(delta, param_name=k)
             new_sd[k] = global_sd[k] + delta
 
-    return new_sd # pyright: ignore[reportReturnType]
+    return (new_sd, len(train_loader.dataset)), cid # pyright: ignore[reportArgumentType, reportReturnType]
 
 @ray.remote(num_cpus=2, num_gpus=0.5)
-def evaluate(global_sd: models.StateDict, splits: ClientSplit, dataset: Dataset, batch_size: int, device: str|torch.device) -> float:
+def evaluate(global_sd: models.StateDict, splits: ClientSplit, dataset: Dataset, batch_size: int, device: str|torch.device, cid) -> tuple[float, int]:
     # x: torch.Tensor
     # y: torch.Tensor
 
@@ -114,4 +116,4 @@ def evaluate(global_sd: models.StateDict, splits: ClientSplit, dataset: Dataset,
             correct += (pred == y).sum().item()
             total += y.size(0)
 
-    return correct / total
+    return (correct / total), cid
