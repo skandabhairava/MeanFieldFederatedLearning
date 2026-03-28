@@ -36,17 +36,17 @@ class Server:
 
         self.proj_dim = 200
 
-        log.debug("starting server...")
+        log.info("starting server...")
         D = sum(p.numel() for p in self.model.state_dict().values())
 
         log.debug("configuring generator")
 
         g = torch.Generator().manual_seed(seed)
 
-        log.debug("selecting dims")
+        log.info("selecting dims")
         self.R = torch.randn(D, self.proj_dim, generator=g) / (self.proj_dim ** 0.5)
 
-        log.debug("finished initing server")
+        log.info("finished initing server")
 
     # FedAVG
     # def aggregate(self, states: list[models.StateDict]):
@@ -77,7 +77,7 @@ class Server:
     def project(self, vec: torch.Tensor) -> np.ndarray:
         return (vec @ self.R).numpy()
 
-    def train(self, dataset: Dataset, name_suffix: str=''):
+    def train(self, dataset: Dataset, name_suffix: str='') -> str:
         # history = []
         name_suffix = '_' + name_suffix if name_suffix else ''
 
@@ -94,8 +94,23 @@ class Server:
         batch_size = ray.put(config.BATCH_SIZE)
         device = ray.put(config.DEVICE)
 
+        # round 0:
+        res = RoundResults(
+            0,
+            [],
+            [],
+            [],
+            self.project(stats.flatten(self.model.state_dict())), # pyright: ignore[reportArgumentType]
+            []
+        )
+
+        with open(f"{config.LOG_DIR}/RUN_{run_id}{name_suffix}/round_0.npy", "wb") as f:
+            pickle.dump(asdict(res), f)
+
+        del res
+
         for round_id in range(1, config.ROUNDS+1):
-            log.info(f"{round_id}/{config.ROUNDS+1}: ")
+            log.info(f"{round_id}/{config.ROUNDS}: ")
             client_accs = self.round(round_id, run_id, dataset_ref, batch_size, device, name_suffix)
                             # self.round writes updates to disk ^^
             # history.append(asdict(res))
@@ -103,7 +118,7 @@ class Server:
             acc = stats.avg(client_accs)
             log.info(f"\tAccuracy: {acc*100:.2f}%")
 
-        # return history
+        return f"{config.LOG_DIR}/RUN_{run_id}{name_suffix}"
 
 
     def round(self, round_id, run_id, dataset_ref: Dataset, batch_size, device, name_suffix: str) -> list[float]:
@@ -163,7 +178,7 @@ class Server:
         del local_sds
         gc.collect()
 
-        global_sd_ref = ray.put(new_global)
+        global_sd_ref = ray.put(new_global[0])
 
         log.debug("Finished training. Starting Eval")
 

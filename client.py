@@ -22,28 +22,24 @@ class Client:
 
         self.attack = None
 
-        if client_type == "byzantine_flip":
-            self.attack = attacks.ByzantineFlip("flip")
-        elif client_type == "scaling_attack":
-            self.attack = attacks.ScalingAttack("scaling")
-        elif client_type == "noise_injection_attack":
-            self.attack = attacks.NoiseInjectionAttack("noise_injection")
-        elif client_type == "random_sign_attack":
-            self.attack = attacks.RandomSignAttack("random_sign")
-        elif client_type == "norm_bound_attack":
-            self.attack = attacks.NormBoundAttack("norm_bound")
-        elif client_type == "mean_shift_attack":
-            self.attack = attacks.MeanShiftAttack("mean_shift")
-        # elif client_type == "layer_backdoor_attack":
-        #     self.attack = attacks.LayerBackdoorAttack("layer_backdoor")
-        # elif client_type == "layer_backdoor_attack2":
-        #     self.attack = attacks.LayerBackdoorAttack2("layer_backdoor2")
-        elif client_type == "coordinated_krum_attack":
-            self.attack = attacks.CoordinatedKrumAttack("coordinated_krum", seed=seed)
-        elif client_type == "sybil_attack":
-            self.attack = attacks.SybilAttack("sybil_attack")
-        elif client_type == "sybil_attack2":
-            self.attack = attacks.SybilAttack2("sybil_attack2")
+        # if client_type == "byzantine_flip":
+        #     self.attack = attacks.ByzantineFlip("flip")
+        # elif client_type == "scaling_attack":
+        #     self.attack = attacks.ScalingAttack("scaling")
+        # elif client_type == "noise_injection_attack":
+        #     self.attack = attacks.NoiseInjectionAttack("noise_injection")
+        # elif client_type == "random_sign_attack":
+        #     self.attack = attacks.RandomSignAttack("random_sign")
+        # elif client_type == "norm_bound_attack":
+        #     self.attack = attacks.NormBoundAttack("norm_bound")
+        # elif client_type == "mean_shift_attack":
+        #     self.attack = attacks.MeanShiftAttack("mean_shift")
+        # elif client_type == "coordinated_krum_attack":
+        #     self.attack = attacks.CoordinatedKrumAttack("coordinated_krum", seed=seed)
+        # elif client_type == "sybil_attack":
+        #     self.attack = attacks.SybilAttack("sybil_attack")
+        # elif client_type == "sybil_attack2":
+        #     self.attack = attacks.SybilAttack2("sybil_attack2")
 
     def train(self, global_sd: models.StateDict, dataset: Dataset, batch_size, device):
         return train.remote(global_sd, self.split, dataset, batch_size, device, self.attack, self.cid)
@@ -87,7 +83,7 @@ def train(global_sd: models.StateDict, split: ClientSplit, dataset: Dataset, bat
         # convert to update space, manipulate, then reconstruct
         for k in new_sd:
             delta: torch.Tensor = new_sd[k] - global_sd[k]            
-            delta = attack.manipulate_update(delta, param_name=k)
+            delta = attack.manipulate_update(delta, global_sd[k], param_name=k)
             new_sd[k] = global_sd[k] + delta
 
     return (new_sd, len(train_loader.dataset)), cid # pyright: ignore[reportArgumentType, reportReturnType]

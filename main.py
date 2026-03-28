@@ -1,4 +1,6 @@
 import logging as log
+import pickle
+import types as typ
 
 import os
 import ray
@@ -38,8 +40,11 @@ def main():
     server = Server(model, clients, config.RANDOM_SEED)
 
     log.info("Starting Training")
-    server.train(combined_data, "20_byzantine_flip")
+    save_folder = server.train(combined_data, "byzantine_flip")
 
+    with open(f"{save_folder}/metadata.npy", "wb") as f:
+        config_file = {key: val for key, val in vars(config).items() if not key.startswith("__") and not isinstance(val, typ.ModuleType)}
+        pickle.dump(config_file, f)
 
 if __name__ == "__main__":
     main()
