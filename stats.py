@@ -17,4 +17,4 @@ def avg(iterator: Iterable[float|int]):
 # avg(i for i in range(10))
 
 def flatten(sd: StateDict):
-    return torch.cat([sd[k].view(-1) for k in sorted(sd.keys())])
+    return torch.cat([sd[k].view(-1) for k in sorted(sd.keys()) if 'running_' not in k])

@@ -26,16 +26,14 @@ def main():
 
     log.debug(f"Sampled clients: {types}")
 
+    model = models.get_model()
+    log.debug("Model loaded.")
+
     clients = [
-        Client(i, client_splits, types[i], seed=config.RANDOM_SEED)
+        Client(i, client_splits, model.state_dict(), types[i], seed=config.RANDOM_SEED) # pyright: ignore[reportArgumentType]
         for i in range(config.NUM_CLIENTS)
     ]
-
     log.debug("Created Clients")
-
-    model = models.get_model()
-
-    log.debug("Model loaded.")
 
     server = Server(model, clients, config.RANDOM_SEED)
 

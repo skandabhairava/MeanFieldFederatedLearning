@@ -14,11 +14,11 @@ from data import ClientSplit
 ModelState = tuple[models.StateDict, int]
 
 class Client:
-    def __init__(self, cid: int, splits: list[ClientSplit], client_type="normal", seed=42):
+    def __init__(self, cid: int, splits: list[ClientSplit], model_state: models.StateDict, client_type="normal", seed=42):
         self.cid = cid
         self.split = splits[cid]
         self.client_type = client_type
-        # self.batch_size = batch_size
+        self.model_state: models.StateDict = model_state
 
         self.attack = None
 
@@ -41,12 +41,11 @@ class Client:
         # elif client_type == "sybil_attack2":
         #     self.attack = attacks.SybilAttack2("sybil_attack2")
 
-    def train(self, global_sd: models.StateDict, dataset: Dataset, batch_size, device):
-        return train.remote(global_sd, self.split, dataset, batch_size, device, self.attack, self.cid)
+    def train(self, dataset: Dataset, batch_size, device):
+        return train.remote(self.model_state, self.split, dataset, batch_size, device, self.attack, self.cid)
 
-    def evaluate(self, global_sd: models.StateDict, dataset: Dataset, batch_size, device):
-        return evaluate.remote(global_sd, self.split, dataset, batch_size, device, self.cid)
-        # return evaluate(self.cid, global_sd, self.split, dataset, self.batch_size, config.DEVICE)
+    def evaluate(self, dataset: Dataset, batch_size, device):
+        return evaluate.remote(self.model_state, self.split, dataset, batch_size, device, self.cid)
 
     @staticmethod    
     def sample_types(n, proportions: dict[str, float]):

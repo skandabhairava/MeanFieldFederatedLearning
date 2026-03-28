@@ -18,6 +18,8 @@ import client
 import models
 import attacks
 
+from typing import Callable
+
 ModelState = tuple[models.StateDict, int]
 
 @dataclass
@@ -119,9 +121,9 @@ class Server:
 
         global_sd: models.StateDict = self.model.state_dict() # pyright: ignore[reportAssignmentType]
 
-        global_sd_ref = ray.put(global_sd)
+        # global_sd_ref = ray.put(global_sd)
 
-        futures = [c.train(global_sd_ref, dataset_ref, batch_size, device) for c in selected]
+        futures = [c.train(dataset_ref, batch_size, device) for c in selected]
         local_sds__cid = ray.get(futures)
         local_sds__cid.sort(key=lambda x: x[1])
 
@@ -132,7 +134,7 @@ class Server:
 
         # calc deltas of each local_update since last round
 
-        del global_sd_ref
+        # del global_sd_ref
 
         if write_logs:
             flat_global = stats.flatten(global_sd)
@@ -146,6 +148,10 @@ class Server:
 
         new_global = self.fed_avg_aggregate(local_sds)
         self.model.load_state_dict(new_global[0])
+
+        # Write the model to all clients
+        for c in self.clients:
+            c.model_state = new_global[0]
 
         if write_logs:
             client_types__selected = [(c.client_type, c.cid) for c in selected]
@@ -173,12 +179,11 @@ class Server:
         del local_sds
         gc.collect()
 
-        global_sd_ref = ray.put(new_global[0])
+        # global_sd_ref = ray.put(new_global[0])
 
         log.debug("Finished training. Starting Eval")
 
-        accs = ray.get([c.evaluate(global_sd_ref, dataset_ref, batch_size, device) for c in self.clients])
-        # accs = [c.evaluate(new_global, dataset) for c in self.clients]
+        accs = ray.get([c.evaluate(dataset_ref, batch_size, device) for c in self.clients])
 
         accs.sort(key=lambda x: x[1])
         accs_, _ = zip(*accs)
