@@ -4,6 +4,7 @@ import numpy as np
 from torch import optim
 import torch.nn.functional as F
 from torch.utils.data import Dataset
+import copy
 
 import data
 import models
@@ -18,7 +19,7 @@ class Client:
         self.cid = cid
         self.split = splits[cid]
         self.client_type = client_type
-        self.model_state: models.StateDict = model_state
+        self.model_state: models.StateDict = copy.deepcopy(model_state)
 
         self.attack = None
 

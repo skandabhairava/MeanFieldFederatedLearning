@@ -35,6 +35,7 @@ class Server:
     def __init__(self, model: torch.nn.Module, clients: list[client.Client], seed: int):
         self.model = model
         self.clients = clients
+        self.clients.sort(key=lambda c: c.cid)
 
         self.proj_dim = 200
 
@@ -65,6 +66,23 @@ class Server:
                 else: # add a scaled value to the avg/global weight client
                     w = client_weights[i][1] / total
                     global_weights[key] = global_weights[key] + w * client_weights[i][0][key]
+        return global_weights, total
+    
+    # FedAttractAVG
+    def fed_attract_aggregate(self, client_weights: Sequence[ModelState], client_dists: list[tuple[float, int]], total_client_dist: float) -> ModelState:
+        # total all of weights
+        total = 0
+        for i in range(len(client_weights)):
+            total += client_weights[i][1]
+        
+        global_weights = client_weights[0][0]
+        for key in global_weights.keys(): # for each param in clients
+            for i in range(len(client_weights)): # for each client
+                if i == 0: # scale global_wights(client i == 0)'s by itself
+                    global_weights[key] = (client_weights[0][1] / total) * (1-(client_dists[0][0] / total_client_dist)) * global_weights[key]
+                else: # add a scaled value to the avg/global weight client
+                    w = client_weights[i][1] / total
+                    global_weights[key] = global_weights[key] + w * client_weights[i][0][key] * (1-(client_dists[i][0] / total_client_dist))
         return global_weights, total
     
     def project(self, vec: torch.Tensor) -> np.ndarray:
@@ -136,30 +154,63 @@ class Server:
 
         # del global_sd_ref
 
-        if write_logs:
-            flat_global = stats.flatten(global_sd)
+        flat_global = stats.flatten(global_sd)
 
+        if write_logs:
             for sd, _total in local_sds:
                 flat_local = stats.flatten(sd)
                 delta = (flat_local - flat_global).cpu()
                 proj_updates.append(self.project(delta))
 
-        log.debug("calcing stats.")
+        # train locally
+        # if False:
+        def dist_func(client_model_state: ModelState) -> float:
+            return torch.norm(flat_global - stats.flatten(client_model_state[0]), p=2).item()
+        
+        client_types__selected = [(c.client_type, c.cid) for c in selected]
+        client_types__selected.sort(key=lambda x: x[1])
 
-        new_global = self.fed_avg_aggregate(local_sds)
+        client_types, selected_id = zip(*client_types__selected)
+        client_types_: list[str] = list(client_types)
+        selected_id_: list[int] = list(selected_id)
+
+        distances_selected = [(dist_func(sds), cid) for sds, cid in local_sds__cid]
+        distances_not_selected = [(dist_func(c.model_state), c.cid) for c in self.clients if c.cid not in selected_id_] # pyright: ignore[reportArgumentType]
+        distances = [i for i in sorted(distances_not_selected + distances_selected, key=lambda x: x[1])]
+        total_dist = sum(i[1] for i in distances)
+
+        # new_global = self.fed_avg_aggregate(local_sds)
+        new_global = self.fed_attract_aggregate(local_sds, distances, total_dist)
         self.model.load_state_dict(new_global[0])
 
+        ####################################################
         # Write the model to all clients
+
+        # # fedavg
+        # for c in self.clients:
+        #     c.model_state = new_global[0]
+
+        # fed_attract_aggregate
         for c in self.clients:
-            c.model_state = new_global[0]
+            # c.model_state = new_global[0]
+            global_weights = new_global[0]
+
+            if distances[c.cid][1] != c.cid:
+                raise # for debugging, to see if distances are aligned
+
+            dist_w = distances[c.cid][0]/total_dist
+
+            for key in global_weights: # for each param in clients
+                c.model_state[key] = global_weights[key] * (1-dist_w) + c.model_state[key] * dist_w
+            # return global_weights, total
+
+        ####################################################
+
+        # for local_sd, cid in local_sds__cid:
+        #     self.clients[cid].model_state = local_sd[0]
 
         if write_logs:
-            client_types__selected = [(c.client_type, c.cid) for c in selected]
-            client_types__selected.sort(key=lambda x: x[1])
-
-            client_types, selected_id = zip(*client_types__selected)
-            client_types_: list[str] = list(client_types)
-            selected_id_: list[int] = list(selected_id)
+            log.debug("calcing stats.")
 
             res = RoundResults(
                 round_id,
