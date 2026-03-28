@@ -40,11 +40,12 @@ def main():
     server = Server(model, clients, config.RANDOM_SEED)
 
     log.info("Starting Training")
-    save_folder = server.train(combined_data, "byzantine_flip")
+    save_folder = server.train(combined_data, "normal", write_logs=config.WRITE_LOGS)
 
-    with open(f"{save_folder}/metadata.npy", "wb") as f:
-        config_file = {key: val for key, val in vars(config).items() if not key.startswith("__") and not isinstance(val, typ.ModuleType)}
-        pickle.dump(config_file, f)
+    if config.WRITE_LOGS:
+        with open(f"{save_folder}/metadata.npy", "wb") as f:
+            config_file = {key: val for key, val in vars(config).items() if not key.startswith("__") and not isinstance(val, typ.ModuleType)}
+            pickle.dump(config_file, f)
 
 if __name__ == "__main__":
     main()
