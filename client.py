@@ -18,12 +18,13 @@ from typing import Callable
 ModelState = tuple[models.StateDict, int]
 
 class Client:
-    def __init__(self, cid: int, splits: list[ClientSplit], model_state: models.StateDict, client_type="normal", seed=42):
+    def __init__(self, cid: int, splits: list[ClientSplit], proj_func: Callable[[torch.Tensor], torch.Tensor], model_state: models.StateDict, client_type="normal", seed=42):
         self.cid = cid
         self.split = splits[cid]
         self.client_type = client_type
         # self.model_state: StateDictPtr = StateDictPtr(model_state, project_func)
         self.model_state = copy.deepcopy(model_state)
+        self.model_state_flattened = proj_func(stats.flatten(self.model_state))
 
         self.attack = None
 

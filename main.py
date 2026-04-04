@@ -32,7 +32,8 @@ def main():
     server = Server(model, types, client_splits, config.NUM_CLIENTS, config.RANDOM_SEED)
 
     log.info("Starting Training")
-    save_folder = server.train(combined_data, "normal", write_logs=config.WRITE_LOGS)
+    # save_folder = server.train(combined_data, "normal", write_logs=config.WRITE_LOGS)
+    save_folder = server.train(combined_data, "normal")
 
     if config.WRITE_LOGS:
         with open(f"{save_folder}/metadata.npy", "wb") as f:
