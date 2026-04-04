@@ -29,13 +29,7 @@ def main():
     model = models.get_model()
     log.debug("Model loaded.")
 
-    clients = [
-        Client(i, client_splits, model.state_dict(), types[i], seed=config.RANDOM_SEED) # pyright: ignore[reportArgumentType]
-        for i in range(config.NUM_CLIENTS)
-    ]
-    log.debug("Created Clients")
-
-    server = Server(model, clients, config.RANDOM_SEED)
+    server = Server(model, types, client_splits, config.NUM_CLIENTS, config.RANDOM_SEED)
 
     log.info("Starting Training")
     save_folder = server.train(combined_data, "normal", write_logs=config.WRITE_LOGS)

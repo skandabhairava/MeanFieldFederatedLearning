@@ -11,6 +11,9 @@ import models
 import config
 import attacks
 from data import ClientSplit
+import stats
+
+from typing import Callable
 
 ModelState = tuple[models.StateDict, int]
 
@@ -19,7 +22,8 @@ class Client:
         self.cid = cid
         self.split = splits[cid]
         self.client_type = client_type
-        self.model_state: models.StateDict = copy.deepcopy(model_state)
+        # self.model_state: StateDictPtr = StateDictPtr(model_state, project_func)
+        self.model_state = copy.deepcopy(model_state)
 
         self.attack = None
 
@@ -43,13 +47,15 @@ class Client:
         #     self.attack = attacks.SybilAttack2("sybil_attack2")
 
     def train(self, dataset: Dataset, batch_size, device):
+        # return train.remote(self.model_state.state_dict, self.split, dataset, batch_size, device, self.attack, self.cid)
         return train.remote(self.model_state, self.split, dataset, batch_size, device, self.attack, self.cid)
 
     def evaluate(self, dataset: Dataset, batch_size, device):
+        # return evaluate.remote(self.model_state.state_dict, self.split, dataset, batch_size, device, self.cid)
         return evaluate.remote(self.model_state, self.split, dataset, batch_size, device, self.cid)
 
     @staticmethod    
-    def sample_types(n, proportions: dict[str, float]):
+    def sample_types(n, proportions: dict[str, float]) -> list[str]:
         assert abs(1 - sum(proportions.values())) < 0.01, "Float values MUST add up to 1"
 
         names = list(proportions.keys())
