@@ -11,6 +11,7 @@ import models
 import config
 import attacks
 from data import ClientSplit
+from client_types import ClientTypes
 import stats
 
 from typing import Callable

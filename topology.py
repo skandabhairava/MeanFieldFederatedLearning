@@ -3,13 +3,23 @@ import torch
 import logging as log
 import copy
 import numpy as np
-from typing import Callable, OrderedDict, Sequence, Union
+from typing import Callable, Sequence
 import models
 import client
 import stats
-from sklearn.cluster import KMeans  # add to requirements
+# from sklearn.cluster import DBSCAN
+from sklearn.cluster._hdbscan.hdbscan import HDBSCAN
+from sklearn.metrics import pairwise_distances
+from sklearn.metrics import pairwise_distances_argmin_min
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import seaborn as sns
 from uuid import uuid4
 import config
+
+from collections import OrderedDict
+
+import threading
 
 class Cluster:
     def __init__(
@@ -20,7 +30,7 @@ class Cluster:
             parent: 'Cluster|None' = None,
             cluster_center: models.StateDict|None = None,
         ) -> None:
-        self.members = members
+        self.members = OrderedDict(members)
         self.parent = parent
         self.dist_func = dist_func
         self.project_func = project_func
@@ -36,12 +46,17 @@ class Cluster:
 
         # distances and total_dist will be recomputed during updates
         self.dists, self.total_dist = self.calc_distances({cid: (c.model_state, c.model_state_flattened) for cid, c in self.members.items()}) #dict[int, tuple[models.StateDict, torch.Tensor]]
+        self.has_split = False
 
-        self.ema_alpha = 0.1
-        self.ema_mean = stats.avg(self.dists.values())
-        self.ema_var = 0.0
 
-        log.info(f"\t\t\tINIT Mean & var: {self.ema_mean}, {self.ema_var}")
+        # X = np.array([m.model_state_flattened.numpy() for m in self.members.values()])
+        # self.pairwise = pairwise_distances(X)
+
+        # self.ema_alpha = 0.9
+        # self.ema_mean = self.pairwise.mean()
+        # self.ema_var = 0.0
+
+        # log.info(f"\t\t\tINIT Mean & var: {self.ema_mean}, {self.ema_var}")
 
     def calc_distances(
             self, 
@@ -77,10 +92,21 @@ class Cluster:
 
         # Now compute distances for this cluster
         self.dists, self.total_dist = self.calc_distances(member_states)
-        diff = stats.avg(self.dists.values()) - self.ema_mean
-        self.ema_mean += self.ema_alpha * diff
-        self.ema_var = (1 - self.ema_alpha) * (self.ema_var + self.ema_alpha * diff * diff)
-        log.info(f"\t\t\tChanged EMA mean and Var: {self.ema_mean} {self.ema_var}")
+
+        # X = np.array([m.model_state_flattened.numpy() for m in self.members.values()])
+        # self.pairwise = pairwise_distances(X)
+
+        # pair_mean = self.pairwise.mean()
+        # pair_var = self.pairwise.var()
+
+        # diff = pair_mean - self.ema_mean
+        # self.ema_mean += self.ema_alpha * diff
+        # self.ema_var = (
+        #     (1 - self.ema_alpha) * self.ema_var
+        #     + self.ema_alpha * pair_var
+        #     + self.ema_alpha * (1 - self.ema_alpha) * diff * diff
+        # )
+        # log.info(f"\t\t\tChanged EMA mean and Var: {self.ema_mean} {self.ema_var}")
 
         # Update this cluster's center using attract_aggregate
         # Build list of (state, dist, ident) for attract_aggregate
@@ -164,10 +190,11 @@ class Cluster:
 
     def print_tree(self, level=0):
         indent = "  " * level
-        if all(isinstance(m, client.Client) for m in self.members):
+        if all(isinstance(m, client.Client) for m in self.members.values()):
             # Leaf cluster
             cids = [str(c.cid) for c in self.members.values()]
             log.info(f"{indent}Cluster (leaf) with clients: {', '.join(cids)}")
+            # log.info(f"{indent}Outliers: {self.find_outlier_clients()}")
         else:
             log.info(f"{indent}Cluster (internal) with {len(self.members)} children")
             for m in self.members.values():
@@ -206,48 +233,93 @@ class Cluster:
             global_weights[key] /= total
 
         return global_weights
-    
-    # @staticmethod
-    # def attract_aggregate(
-    #     client_weights: dict[int, tuple[models.StateDict, torch.Tensor]],
-    #     dists: dict[int, float],
-    #     cluster_center: models.StateDict,
-    #     total_client_dist: float
-    # ) -> models.StateDict:
-    #     """Weighted aggregation where weight = 1 - (dist/total_dist), vectorized."""
 
-    #     if not client_weights:
-    #         return copy.deepcopy(cluster_center)
+    def split(self):
+        # hardcoding for now, based on set seed
+        if self.has_split:
+            for m in self.members.values():
+                if isinstance(m, Cluster):
+                    m.split()
 
-    #     global_weights = copy.deepcopy(cluster_center)
+            return
 
-    #     # Precompute weights tensor
-    #     idents = list(client_weights.keys())
+        members: list['client.Client|Cluster'] = []
+        member_cid: list[int] = []
 
-    #     if total_client_dist > 0:
-    #         weights = torch.tensor(
-    #             [1 - (dists[i] / total_client_dist) for i in idents],
-    #             dtype=torch.float32
-    #         )
-    #     else:
-    #         weights = torch.ones(len(idents), dtype=torch.float32)
+        for cid, mem in self.members.items():
+            member_cid.append(cid)
+            members.append(mem)
 
-    #     # Normalize once (avoids repeated division per key)
-    #     weights = weights / weights.sum()
+        X = np.array([m.model_state_flattened.numpy() for m in members])
+        # dists = pairwise_distances(X)
 
-    #     for key in global_weights.keys():
-    #         # Stack all client tensors for this key
-    #         stacked = torch.stack([
-    #             client_weights[i][0][key] for i in idents
-    #         ], dim=0)  # shape: (num_clients, ...)
+        # hdb = DBSCAN(min_samples=2, eps=(self.ema_mean + 1*(self.ema_var**0.5)))
+        hdb = HDBSCAN(min_cluster_size=2, copy=True) # pyright: ignore[reportArgumentType]
+        clusterer = hdb.fit(X)
 
-    #         # Reshape weights for broadcasting
-    #         w = weights.view(-1, *([1] * (stacked.dim() - 1)))
+        labels_all: np.ndarray = clusterer.labels_.copy()
 
-    #         # Weighted sum
-    #         global_weights[key] = torch.sum(stacked * w, dim=0)
+        log.info(f"\t\t{labels_all=}")
+        # log.info(f"\t\tDist stas: {dists.mean()=}, {dists.std()=}")
 
-    #     return global_weights
+        unique_clusters = set(labels_all) - {-1}
+        centers = np.array([X[labels_all == c].mean(axis=0) for c in unique_clusters])
+
+        # Find noise points
+        noise_idx = np.where(labels_all == -1)[0]
+
+        # Assign each noise point to nearest cluster center
+        nearest, _ = pairwise_distances_argmin_min(X[noise_idx], centers)
+
+        for i, idx in enumerate(noise_idx):
+            labels_all[idx] = list(unique_clusters)[nearest[i]]
+
+        label_members: dict[int, list[int]] = {}
+        for i, l in enumerate(labels_all):
+            label_members.setdefault(l.item(), []).append(i)
+
+        log.info(f"\t\t{label_members=}")
+
+        # def _run():
+
+        #     X2 = PCA(n_components=2).fit_transform(X)
+        #     colors = {}
+        #     for label in label_members.keys():
+        #         if label == -1:
+        #             colors[label] = 'gray'
+        #         else:
+        #             # Generate random color
+        #             colors[label] = np.random.rand(3,)
+
+        #     plt.figure()
+        #     for label, clients in label_members.items():
+        #         mask = labels_all == label
+        #         color = colors[label]
+        #         label_name = f'Label {label}' if label != -1 else 'Noise/Outlier'
+        #         plt.scatter(X2[mask, 0], X2[mask, 1],
+        #                 c=[color], label=label_name, alpha=0.7, s=50)
+                
+        #     plt.show()
+
+        # thread = threading.Thread(target=_run)
+        # thread.start()
+
+        ####################################################
+
+        new_clusters_members_dict = [{idx: self.members[idx] for idx in cluster} for label_id, cluster in label_members.items()]
+        new_clusters = [Cluster(i, self.dist_func, self.project_func, self) for i in new_clusters_members_dict]
+
+        self.members = {c.cid: c for c in new_clusters}
+
+        self.dists, self.total_dist = self.calc_distances({cid: (c.model_state, c.model_state_flattened) for cid, c in self.members.items()}) #dict[int, tuple[models.StateDict, torch.Tensor]]
+
+        # self.ema_alpha = 0.1
+        # self.ema_mean = stats.avg(self.dists.values())
+        # self.ema_var = 0.0
+
+        # log.info(f"\t\tSPLIT Mean & var: {self.ema_mean}, {self.ema_var}")
+
+        self.has_split = True
 
     @staticmethod
     def avg_model_states(client_weights: Sequence[tuple[int, models.StateDict]]) -> models.StateDict:
@@ -263,14 +335,14 @@ class Cluster:
             global_weights[key] /= len(client_weights)
         return global_weights
 
-    def find_outlier_clients(self):
-        std = self.ema_var**0.5
-        max_d = (self.ema_mean + 1.5*std)
+    # def find_outlier_clients(self):
+    #     std = self.ema_var**0.5
+    #     max_d = (self.ema_mean + 1.5*std)
 
-        cids: list[int] = []
+    #     cids: list[int] = []
 
-        for cid, d in self.dists.items():
-            if d > max_d:
-                cids.append(cid)
+    #     for cid, d in self.dists.items():
+    #         if d > max_d:
+    #             cids.append(cid)
 
-        return cids
+    #     return cids

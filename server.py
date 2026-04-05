@@ -20,7 +20,7 @@ class Server:
     def __init__(self, model: torch.nn.Module, client_types: list[str], client_splits: list[data.ClientSplit], num_clients: int, seed: int):
         self.model = model
 
-        self.proj_dim = 200
+        self.proj_dim = 20
 
         log.info("starting server...")
         D = sum(p.numel() for p in self.model.state_dict().values())
@@ -64,10 +64,9 @@ class Server:
             client_accs = self.round(round_id, run_id, dataset_ref, batch_size, device)
 
             acc = stats.avg(client_accs)
-            log.info(f"\tAccuracy: {acc*100:.2f}%")
-            log.info(f"\tMean Dist from Center: {self.global_cluster.ema_mean} | Std: {self.global_cluster.ema_var**0.5}")
-            if round_id % 1 == 0:
-                log.info(f"\tOutlier CIDs: {self.global_cluster.find_outlier_clients()}")
+            log.info(f"\tAccuracy: {acc*100:.2f}% | {len(client_accs)} total clients evaluated.")
+            # log.info(f"\tMean Dist from Center: {self.global_cluster.ema_mean} | Std: {self.global_cluster.ema_var**0.5}")
+            self.global_cluster.print_tree()
 
         return f"{config.LOG_DIR}/RUN_{run_id}{name_suffix}"
 
@@ -86,7 +85,13 @@ class Server:
         start = time.time()
         for sd, cid in local_sds__cid:
             self.clients[cid].model_state = sd[0]
+            self.clients[cid].model_state_flattened = self.project(stats.flatten(sd[0]))
         log.info(f"\t\tTime taken to copy updates: {time.time() - start}")
+
+        if round_id % 5 == 0:
+            start = time.time()
+            self.global_cluster.split()
+            log.info(f"\t\tTime taken to Split: {time.time() - start}")
 
         start = time.time()
         self.global_cluster.update_centers_upward(updated_states)

@@ -3,7 +3,7 @@ from client_types import ClientTypes
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-NUM_CLIENTS = 20
+NUM_CLIENTS = 30
 # CLIENT_FRAC = 0.5
 CLIENT_FRAC = 1
 
@@ -13,7 +13,7 @@ LR = 1e-4
 
 ROUNDS = 30
 
-DIRICHLET_ALPHA = 0.1
+DIRICHLET_ALPHA = 0.5
 # 0 -> HIGH NON-IID, 1 -> IID
 
 LOG_DIR = "./logs"
