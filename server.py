@@ -98,7 +98,7 @@ class Server:
 
         log.info("Finished training. Starting Eval")
 
-        accs = ray.get([c.evaluate(dataset_ref, batch_size, device) for c in self.clients]) # list[tuple[float, client_id#int]]
+        accs = ray.get([c.evaluate(dataset_ref, batch_size, device) for c in self.clients if c.client_type == client.ClientTypes.NORMAL]) # list[tuple[float, client_id#int]]
 
         accs.sort(key=lambda x: x[1])
         accs_, _ = zip(*accs)

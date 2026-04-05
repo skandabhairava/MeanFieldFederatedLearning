@@ -1,4 +1,5 @@
 import torch
+from client_types import ClientTypes
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -24,7 +25,7 @@ NUM_GPUS = 1
 
 # client typing
 CLIENT_TYPES = {
-    "normal": 1.0,
+    ClientTypes.NORMAL: 1.0,
     # "byzantine_flip": 0.2,
 }
 

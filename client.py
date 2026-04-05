@@ -18,10 +18,10 @@ from typing import Callable
 ModelState = tuple[models.StateDict, int]
 
 class Client:
-    def __init__(self, cid: int, splits: list[ClientSplit], proj_func: Callable[[torch.Tensor], torch.Tensor], model_state: models.StateDict, client_type="normal", seed=42):
+    def __init__(self, cid: int, splits: list[ClientSplit], proj_func: Callable[[torch.Tensor], torch.Tensor], model_state: models.StateDict, client_type: ClientTypes=ClientTypes.NORMAL, seed=42):
         self.cid = cid
         self.split = splits[cid]
-        self.client_type = client_type
+        self.client_type: ClientTypes = client_type
         # self.model_state: StateDictPtr = StateDictPtr(model_state, project_func)
         self.model_state = copy.deepcopy(model_state)
         self.model_state_flattened = proj_func(stats.flatten(self.model_state))
@@ -56,7 +56,7 @@ class Client:
         return evaluate.remote(self.model_state, self.split, dataset, batch_size, device, self.cid)
 
     @staticmethod    
-    def sample_types(n, proportions: dict[str, float]) -> list[str]:
+    def sample_types(n, proportions: dict[ClientTypes, float]) -> list[str]:
         assert abs(1 - sum(proportions.values())) < 0.01, "Float values MUST add up to 1"
 
         names = list(proportions.keys())
