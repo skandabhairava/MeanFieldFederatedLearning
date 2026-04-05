@@ -9,6 +9,7 @@ import client
 import stats
 from sklearn.cluster import KMeans  # add to requirements
 from uuid import uuid4
+import config
 
 class Cluster:
     def __init__(
@@ -34,13 +35,21 @@ class Cluster:
         self.model_state_flattened = self.project_func(stats.flatten(self.model_state))
 
         # distances and total_dist will be recomputed during updates
-        self.dists: dict[int, float] = {}
-        self.total_dist = 0.0
+        self.dists, self.total_dist = self.calc_distances({cid: (c.model_state, c.model_state_flattened) for cid, c in self.members.items()}) #dict[int, tuple[models.StateDict, torch.Tensor]]
 
-    def calc_distances(self, member_states: dict[int, tuple[models.StateDict, torch.Tensor]]) -> tuple[dict[int, float], float]:
+        self.ema_alpha = 0.1
+        self.ema_mean = stats.avg(self.dists.values())
+        self.ema_var = 0.0
+
+        log.info(f"\t\t\tINIT Mean & var: {self.ema_mean}, {self.ema_var}")
+
+    def calc_distances(
+            self, 
+            member_states: dict[int, tuple[models.StateDict, torch.Tensor]]
+        ) -> tuple[dict[int, float], float]:
         """
         Compute distances from each member's state to this cluster's flattened center.
-        member_states: list of (state_dict, identifier) where identifier is cid for clients or -1 for clusters.
+        member_states: dict of (identifier: state_dict) where identifier is cid.
         """
         dists = {}
         total_dist = 0.0
@@ -58,16 +67,7 @@ class Cluster:
         # First, update child clusters (if any) and collect their current states
         member_states: dict[int, tuple[models.StateDict, torch.Tensor]] = {}
         for cid, m in self.members.items():
-            if isinstance(m, client.Client):
-                # if m.cid in updated_client_states:
-                #     # Use the updated state (already applied to client model_state elsewhere? careful)
-                #     # We assume client.model_state is already updated before calling this.
-                #     state = updated_client_states[m.cid]
-                # else:
-                #     state = m.model_state
-
-                state = m.model_state_flattened
-                
+            if isinstance(m, client.Client):                
                 member_states[m.cid] = (m.model_state, m.model_state_flattened)
             else:
                 # Recursively update child cluster
@@ -77,6 +77,10 @@ class Cluster:
 
         # Now compute distances for this cluster
         self.dists, self.total_dist = self.calc_distances(member_states)
+        diff = stats.avg(self.dists.values()) - self.ema_mean
+        self.ema_mean += self.ema_alpha * diff
+        self.ema_var = (1 - self.ema_alpha) * (self.ema_var + self.ema_alpha * diff * diff)
+        log.info(f"\t\t\tChanged EMA mean and Var: {self.ema_mean} {self.ema_var}")
 
         # Update this cluster's center using attract_aggregate
         # Build list of (state, dist, ident) for attract_aggregate
@@ -95,22 +99,27 @@ class Cluster:
         From root downward, update child clusters and clients using the new center and distances.
         """
         # First update this cluster's own members (clients or child clusters)
+        inv_total = 1.0 / self.total_dist if self.total_dist > 0 else 0.0
         for cid, m in self.members.items():
             # Find distance for this member
             # Find matching dist
-            dist_w = self.dists.get(m.cid, 0.0) / self.total_dist if self.total_dist > 0 else 0.0
+            dist_w = self.dists.get(m.cid, 0.0) * inv_total
+            one_minus_dist = (1 - dist_w)
 
             # For a client: update its model_state using convex combination
             if isinstance(m, client.Client):
                 for key in self.model_state:
-                    m.model_state[key] = (self.model_state[key] * (1 - dist_w)) + (m.model_state[key] * dist_w)
+                    # m.model_state[key] = (self.model_state[key] * (1 - dist_w)) + (m.model_state[key] * dist_w)
+                    m.model_state[key].mul_(dist_w).add_(self.model_state[key], alpha=one_minus_dist)
 
                 m.model_state_flattened = self.project_func(stats.flatten(m.model_state))
             else:
                 # For a child cluster: update its center and then propagate further down
                 # Use same formula: child center = (parent_center*(1-dist_w)) + (child_center*dist_w)
                 for key in self.model_state:
-                    m.model_state[key] = (self.model_state[key] * (1 - dist_w)) + (m.model_state[key] * dist_w)
+                    # m.model_state[key] = (self.model_state[key] * (1 - dist_w)) + (m.model_state[key] * dist_w)
+                    m.model_state[key].mul_(dist_w).add_(self.model_state[key], alpha=one_minus_dist)
+
                 m.model_state_flattened = self.project_func(stats.flatten(m.model_state))
                 # Also update child's distances? Not needed; child will recompute when propagate_downward called on it.
                 m.propagate_downward()
@@ -167,7 +176,6 @@ class Cluster:
                 else:
                     log.info(f"{indent}  Client {m.cid}")
 
-    # Static methods (unchanged except signature adaptation)
     @staticmethod
     def attract_aggregate(
         client_weights: dict[int, tuple[models.StateDict, torch.Tensor]],  # (state, ident, distance)
@@ -198,16 +206,48 @@ class Cluster:
             global_weights[key] /= total
 
         return global_weights
+    
+    # @staticmethod
+    # def attract_aggregate(
+    #     client_weights: dict[int, tuple[models.StateDict, torch.Tensor]],
+    #     dists: dict[int, float],
+    #     cluster_center: models.StateDict,
+    #     total_client_dist: float
+    # ) -> models.StateDict:
+    #     """Weighted aggregation where weight = 1 - (dist/total_dist), vectorized."""
 
-        # for ident, state in client_weights.items():
-        #     w = 1 - (dists[ident] / total_client_dist) if total_client_dist > 0 else 1.0
-        #     total_weight += w
-        #     for key in global_weights:
-        #         global_weights[key] = state[key] * w
+    #     if not client_weights:
+    #         return copy.deepcopy(cluster_center)
 
-        # for key in global_weights:
-        #     global_weights[key] /= total_weight
-        return global_weights
+    #     global_weights = copy.deepcopy(cluster_center)
+
+    #     # Precompute weights tensor
+    #     idents = list(client_weights.keys())
+
+    #     if total_client_dist > 0:
+    #         weights = torch.tensor(
+    #             [1 - (dists[i] / total_client_dist) for i in idents],
+    #             dtype=torch.float32
+    #         )
+    #     else:
+    #         weights = torch.ones(len(idents), dtype=torch.float32)
+
+    #     # Normalize once (avoids repeated division per key)
+    #     weights = weights / weights.sum()
+
+    #     for key in global_weights.keys():
+    #         # Stack all client tensors for this key
+    #         stacked = torch.stack([
+    #             client_weights[i][0][key] for i in idents
+    #         ], dim=0)  # shape: (num_clients, ...)
+
+    #         # Reshape weights for broadcasting
+    #         w = weights.view(-1, *([1] * (stacked.dim() - 1)))
+
+    #         # Weighted sum
+    #         global_weights[key] = torch.sum(stacked * w, dim=0)
+
+    #     return global_weights
 
     @staticmethod
     def avg_model_states(client_weights: Sequence[tuple[int, models.StateDict]]) -> models.StateDict:
@@ -222,3 +262,15 @@ class Cluster:
 
             global_weights[key] /= len(client_weights)
         return global_weights
+
+    def find_outlier_clients(self):
+        std = self.ema_var**0.5
+        max_d = (self.ema_mean + 1.5*std)
+
+        cids: list[int] = []
+
+        for cid, d in self.dists.items():
+            if d > max_d:
+                cids.append(cid)
+
+        return cids

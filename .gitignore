@@ -4,3 +4,4 @@ data
 __pycache__
 *swp
 *temp*
+.ipynb_checkpoints/

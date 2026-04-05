@@ -65,6 +65,9 @@ class Server:
 
             acc = stats.avg(client_accs)
             log.info(f"\tAccuracy: {acc*100:.2f}%")
+            log.info(f"\tMean Dist from Center: {self.global_cluster.ema_mean} | Std: {self.global_cluster.ema_var**0.5}")
+            if round_id % 1 == 0:
+                log.info(f"\tOutlier CIDs: {self.global_cluster.find_outlier_clients()}")
 
         return f"{config.LOG_DIR}/RUN_{run_id}{name_suffix}"
 
@@ -72,16 +75,26 @@ class Server:
         m = int(len(self.clients) * config.CLIENT_FRAC)
         selected = random.sample(self.clients, m)
 
+        start = time.time()
         futures = [c.train(dataset_ref, batch_size, device) for c in selected]
         local_sds__cid = ray.get(futures)
+        log.info(f"\t\tTime taken to train: {time.time() - start}")
 
         updated_states = {cid: sd[0] for sd, cid in local_sds__cid}
 
+
+        start = time.time()
         for sd, cid in local_sds__cid:
             self.clients[cid].model_state = sd[0]
+        log.info(f"\t\tTime taken to copy updates: {time.time() - start}")
 
+        start = time.time()
         self.global_cluster.update_centers_upward(updated_states)
+        log.info(f"\t\tTime taken to update : {time.time() - start}")
+
+        start = time.time()
         self.global_cluster.propagate_downward()
+        log.info(f"\t\tTime taken to propagate downwards: {time.time() - start}")
 
         log.info("Finished training. Starting Eval")
 

@@ -12,6 +12,8 @@ import models
 from client import Client
 from server import Server
 
+from dataset_analysis import analyze_splits_async
+
 def main():
     os.makedirs(config.LOG_DIR, exist_ok=True)
     lib.set_all_seeds(config.RANDOM_SEED)
@@ -21,6 +23,8 @@ def main():
 
     # train_loaders, test_loaders = data.generate_federated_dataloaders(config.NUM_CLIENTS, config.DIRICHLET_ALPHA, config.BATCH_SIZE, train_test_split_ratio=0.8)
     client_splits, combined_data = data.generate_client_splits(config.NUM_CLIENTS, config.DIRICHLET_ALPHA, train_test_split_ratio=0.8)
+
+    analyze_splits_async(combined_data, client_splits, 10)
 
     types = Client.sample_types(config.NUM_CLIENTS, config.CLIENT_TYPES)
 

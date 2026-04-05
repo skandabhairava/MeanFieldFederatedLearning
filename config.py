@@ -12,7 +12,8 @@ LR = 1e-4
 
 ROUNDS = 30
 
-DIRICHLET_ALPHA = 0.8
+DIRICHLET_ALPHA = 0.1
+# 0 -> HIGH NON-IID, 1 -> IID
 
 LOG_DIR = "./logs"
 WRITE_LOGS = False

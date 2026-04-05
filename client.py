@@ -63,6 +63,11 @@ class Client:
         probs = list(proportions.values())
         return list(np.random.choice(names, size=n, p=probs))
     
+    @staticmethod
+    def propagate_downward():
+        # should do nothing. Just exists to reduce run-time reflection check
+        pass
+
 @ray.remote(num_cpus=2, num_gpus=0.5)
 def train(global_sd: models.StateDict, split: ClientSplit, dataset: Dataset, batch_size: int, device: str|torch.device, attack: None|attacks.Attack, cid: int) -> tuple[ModelState, int]:
     model = models.get_model().to(device)
