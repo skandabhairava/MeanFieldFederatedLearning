@@ -13,6 +13,7 @@ from client import Client
 from server import Server
 
 from dataset_analysis import analyze_splits_async
+from collections import Counter
 
 def main():
     os.makedirs(config.LOG_DIR, exist_ok=True)
@@ -28,7 +29,7 @@ def main():
 
     types = Client.sample_types(config.NUM_CLIENTS, config.CLIENT_TYPES)
 
-    log.debug(f"Sampled clients: {types}")
+    log.info(f"Sampled clients: {Counter(types)}")
 
     model = models.get_model()
     log.debug("Model loaded.")

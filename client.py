@@ -49,14 +49,9 @@ class Client:
         names = list(proportions.keys())
         probs = list(proportions.values())
         return list(np.random.choice(names, size=n, p=probs))
-    
-    @staticmethod
-    def propagate_downward():
-        # should do nothing. Just exists to reduce run-time reflection check
-        pass
 
 @ray.remote(num_cpus=2, num_gpus=0.5)
-def train(global_sd: models.StateDict, split: ClientSplit, dataset: Dataset, batch_size: int, device: str|torch.device, attack: None|attacks.Attack, cid: int) -> tuple[ModelState, int]:
+def train(global_sd: models.StateDict, split: ClientSplit, dataset: Dataset, batch_size: int, device: str|torch.device, attack: None|attacks_2.Attack, cid: int) -> tuple[ModelState, int]:
     model = models.get_model().to(device)
     model.load_state_dict(global_sd)
 
@@ -75,8 +70,9 @@ def train(global_sd: models.StateDict, split: ClientSplit, dataset: Dataset, bat
             loss.backward()
             opt.step()
 
-    new_sd = model.state_dict()
-    new_sd = {k: v.cpu() for k, v in new_sd.items()}
+    new_sd = model.cpu().state_dict()
+    # new_sd = {k: v.cpu() for k, v in new_sd.items()}
+
 
     if attack is not None:
         # convert to update space, manipulate, then reconstruct

@@ -28,7 +28,7 @@ class SubtleALIEAttack(Attack):
         self.epsilon = epsilon
         self.global_sd = {}
         self.shared_seed = None      # will be set in prepare
-        self.sample = 0.6       # used only during prepare (read‑only later)
+        self.sample = 0.3       # used only during prepare (read‑only later)
         self.copy_layer_names_affected = []
 
     def prepare(self, ref_state_dict: models.StateDict, model: type[torch.nn.Module]):
