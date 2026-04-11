@@ -129,7 +129,7 @@ class Cluster:
         for cid, m in self.members.items():
             # Find distance for this member
             # Find matching dist
-            dist_w = self.dists.get(m.cid, 0.0) * inv_total
+            dist_w = self.dists[m.cid] * inv_total
             one_minus_dist = (1 - dist_w)
 
             # For a client: update its model_state using convex combination
@@ -150,43 +150,34 @@ class Cluster:
                 # Also update child's distances? Not needed; child will recompute when propagate_downward called on it.
                 m.propagate_downward()
 
-    # def split(self, round_id: int, n_clusters: int = 2) -> bool:
+    # def propagate_downward_inv(self) -> None:
     #     """
-    #     Split this cluster if it contains only clients (leaf) and the number of clients >= n_clusters*2.
-    #     Performs k-means on flattened client states and creates sub-clusters.
-    #     Returns True if split occurred.
+    #     From root downward, update child clusters and clients using the new center and distances.
     #     """
-    #     # Only split if all members are clients (no sub-clusters yet)
-    #     if not all(isinstance(m, client.Client) for m in self.members):
-    #         return False
-    #     if len(self.members) < n_clusters * 2:
-    #         return False
+    #     # First update this cluster's own members (clients or child clusters)
+    #     # inv_total = 1.0 / self.total_dist if self.total_dist > 0 else 0.0
+    #     for cid, m in self.members.items():
+    #         # Find distance for this member
+    #         # Find matching dist
+    #         dist_w = self.total_dist / self.dists[m.cid]
 
-    #     # Collect client states as feature vectors
-    #     clients = self.members
-    #     states_flattened = [stats.flatten(c.model_state).numpy() for c in clients]
-    #     X = np.stack(states_flattened)
+    #         # For a client: update its model_state using convex combination
+    #         if isinstance(m, client.Client):
+    #             for key in self.model_state:
+    #                 # m.model_state[key] = (self.model_state[key] * (1 - dist_w)) + (m.model_state[key] * dist_w)
+    #                 m.model_state[key].mul_(dist_w).add_(self.model_state[key], alpha=one_minus_dist)
 
-    #     kmeans = KMeans(n_clusters=n_clusters, random_state=round_id, n_init=10)
-    #     labels = kmeans.fit_predict(X)
+    #             m.model_state_flattened = self.project_func(stats.flatten(m.model_state))
+    #         else:
+    #             # For a child cluster: update its center and then propagate further down
+    #             # Use same formula: child center = (parent_center*(1-dist_w)) + (child_center*dist_w)
+    #             for key in self.model_state:
+    #                 # m.model_state[key] = (self.model_state[key] * (1 - dist_w)) + (m.model_state[key] * dist_w)
+    #                 m.model_state[key].mul_(dist_w).add_(self.model_state[key], alpha=one_minus_dist)
 
-    #     # Create new clusters
-    #     new_clusters = []
-    #     for k in range(n_clusters):
-    #         cluster_clients = [clients[i] for i, lbl in enumerate(labels) if lbl == k]
-    #         if len(cluster_clients) > 0:
-    #             subcluster = Cluster(
-    #                 members=cluster_clients,
-    #                 dist_func=self.dist_func,
-    #                 parent=self,
-    #                 cluster_center=None
-    #             )
-    #             new_clusters.append(subcluster)
-
-    #     # Replace members with sub-clusters
-    #     self.members = new_clusters
-    #     log.info(f"Round {round_id}: Cluster split into {len(new_clusters)} sub-clusters")
-    #     return True
+    #             m.model_state_flattened = self.project_func(stats.flatten(m.model_state))
+    #             # Also update child's distances? Not needed; child will recompute when propagate_downward called on it.
+    #             m.propagate_downward()
 
     def print_tree(self, level=0):
         indent = "  " * level
@@ -221,7 +212,7 @@ class Cluster:
             assign = True
 
             for ident, state__flat in client_weights.items():
-                w = 1 - (dists[ident] / total_client_dist) if total_client_dist > 0 else 1.0
+                w = (total_client_dist / dists[ident]) if dists[ident] != 0 else 1.0 #1 - (dists[ident] / total_client_dist) if total_client_dist > 0 else 1.0
                 if assign:
                     global_weights[key] = state__flat[0][key] * w
                     assign = False
@@ -242,44 +233,66 @@ class Cluster:
                     m.split()
 
             return
+        
+        if len(self.members) == 2:
+            log.info(f"Cluster '{self.cid}' has reached min_cluster_size")
+            return
 
-        members: list['client.Client|Cluster'] = []
+        members: list['client.Client'] = []
         member_cid: list[int] = []
 
         for cid, mem in self.members.items():
+            assert isinstance(mem, client.Client), f"{mem.cid} in cluster {self.cid} is supposed to be a CLIENT, not a CLuster."
             member_cid.append(cid)
             members.append(mem)
 
         X = np.array([m.model_state_flattened.numpy() for m in members])
-        # dists = pairwise_distances(X)
+        dists = pairwise_distances(X)
 
-        # hdb = DBSCAN(min_samples=2, eps=(self.ema_mean + 1*(self.ema_var**0.5)))
-        hdb = HDBSCAN(min_cluster_size=2, copy=True) # pyright: ignore[reportArgumentType]
-        clusterer = hdb.fit(X)
-
-        labels_all: np.ndarray = clusterer.labels_.copy()
-
-        log.info(f"\t\t{labels_all=}")
-        # log.info(f"\t\tDist stas: {dists.mean()=}, {dists.std()=}")
-
-        unique_clusters = set(labels_all) - {-1}
-        centers = np.array([X[labels_all == c].mean(axis=0) for c in unique_clusters])
-
-        # Find noise points
-        noise_idx = np.where(labels_all == -1)[0]
-
-        # Assign each noise point to nearest cluster center
-        nearest, _ = pairwise_distances_argmin_min(X[noise_idx], centers)
-
-        for i, idx in enumerate(noise_idx):
-            labels_all[idx] = list(unique_clusters)[nearest[i]]
+        if not np.allclose(dists, dists.T, atol=1e-12):
+            log.info(f"\t\t!!! DISTS MATRIX WAS ASYMMETRIC {dists}\n\n")
+            dists = (dists + dists.T) / 2
 
         label_members: dict[int, list[int]] = {}
-        for i, l in enumerate(labels_all):
-            label_members.setdefault(l.item(), []).append(i)
+
+        for min_amt in range(min(len(self.members), 5), 1, -1):
+            hdb = HDBSCAN(min_cluster_size=min_amt, copy=True, metric='precomputed', n_jobs=-1) # pyright: ignore[reportArgumentType]
+            clusterer = hdb.fit(dists)
+
+            labels_all: np.ndarray = clusterer.labels_.copy()
+
+            log.info(f"\t\t{labels_all=}")
+            # log.info(f"\t\tDist stas: {dists.mean()=}, {dists.std()=}")
+
+            unique_clusters = set(labels_all) - {-1}
+
+            # Find noise points
+            noise_idx = np.where(labels_all == -1)[0]
+
+            # Assign each noise point to nearest cluster center
+            if len(noise_idx) != 0 and len(unique_clusters) != 0:
+                centers = np.array([X[labels_all == c].mean(axis=0) for c in unique_clusters])
+                
+                nearest, _ = pairwise_distances_argmin_min(X[noise_idx], centers)
+                unique_clusters_list = list(unique_clusters)
+
+                for i, idx in enumerate(noise_idx):
+                    labels_all[idx] = unique_clusters_list[nearest[i]]
+
+            label_members.clear()
+            assert len(member_cid) == len(labels_all)
+            for cid, l in zip(member_cid, labels_all):
+                label_members.setdefault(l.item(), []).append(cid)
+
+            if len(label_members) != 1:
+                log.info(f"Cluster '{self.cid}' splitting with min cluster size: {min_amt}")
+                break
 
         log.info(f"\t\t{label_members=}")
-
+        if len(label_members) == 1:
+            log.info(f"Cluster '{self.cid}' children aren't diverse to form other clusters.")
+            return
+        
         # def _run():
 
         #     X2 = PCA(n_components=2).fit_transform(X)
