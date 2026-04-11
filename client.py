@@ -9,12 +9,13 @@ import copy
 import data
 import models
 import config
-import attacks
+import attacks_2
 from data import ClientSplit
 from client_types import ClientTypes
 import stats
 
 from typing import Callable
+import logging as log
 
 ModelState = tuple[models.StateDict, int]
 
@@ -29,24 +30,9 @@ class Client:
 
         self.attack = None
 
-        # if client_type == "byzantine_flip":
-        #     self.attack = attacks.ByzantineFlip("flip")
-        # elif client_type == "scaling_attack":
-        #     self.attack = attacks.ScalingAttack("scaling")
-        # elif client_type == "noise_injection_attack":
-        #     self.attack = attacks.NoiseInjectionAttack("noise_injection")
-        # elif client_type == "random_sign_attack":
-        #     self.attack = attacks.RandomSignAttack("random_sign")
-        # elif client_type == "norm_bound_attack":
-        #     self.attack = attacks.NormBoundAttack("norm_bound")
-        # elif client_type == "mean_shift_attack":
-        #     self.attack = attacks.MeanShiftAttack("mean_shift")
-        # elif client_type == "coordinated_krum_attack":
-        #     self.attack = attacks.CoordinatedKrumAttack("coordinated_krum", seed=seed)
-        # elif client_type == "sybil_attack":
-        #     self.attack = attacks.SybilAttack("sybil_attack")
-        # elif client_type == "sybil_attack2":
-        #     self.attack = attacks.SybilAttack2("sybil_attack2")
+        if client_type == ClientTypes.ALIE:
+            log.info(f"Client {self.cid} has been assigned type: {client_type}")
+            self.attack = attacks_2.SubtleALIEAttack("alie")
 
     def train(self, dataset: Dataset, batch_size, device):
         # return train.remote(self.model_state.state_dict, self.split, dataset, batch_size, device, self.attack, self.cid)

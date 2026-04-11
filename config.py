@@ -14,7 +14,7 @@ LR = 1e-4
 ROUNDS = 30
 
 DIRICHLET_ALPHA = 0.5
-# 0 -> HIGH NON-IID, 1 -> IID
+# 0 -> HIGH NON-IID, 100 -> IID
 
 LOG_DIR = "./logs"
 WRITE_LOGS = False
@@ -25,8 +25,10 @@ NUM_GPUS = 1
 
 # client typing
 CLIENT_TYPES = {
-    ClientTypes.NORMAL: 1.0,
-    # "byzantine_flip": 0.2,
+    # ClientTypes.NORMAL: 1.0,
+
+    ClientTypes.NORMAL: 0.9,
+    ClientTypes.ALIE: 0.1
 }
 
 RANDOM_SEED = 60123
