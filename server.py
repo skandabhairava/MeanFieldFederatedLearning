@@ -59,6 +59,10 @@ class Server:
         batch_size = ray.put(config.BATCH_SIZE)
         device = ray.put(config.DEVICE)
 
+        for c in self.clients:
+            if c.attack is not None:
+                c.attack.prepare(self.model.state_dict(), models.get_model) # pyright: ignore[reportArgumentType]
+
         for round_id in range(1, config.ROUNDS+1):
             log.info(f"{round_id}/{config.ROUNDS}: ")
             client_accs = self.round(round_id, run_id, dataset_ref, batch_size, device)
