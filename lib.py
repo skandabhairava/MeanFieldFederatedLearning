@@ -1,13 +1,37 @@
 import os
 import random
 import logging as log
+import time
 
+import config
 import torch
 import numpy as np
 
-def set_log_level(level: int):
+def set_log_level(level: int, log_file: str|None = None):
     logger = log.getLogger()
     logger.setLevel(level)
+
+    class SaveFilter(log.Filter):
+        def filter(self, record):
+            return getattr(record, "save", False)
+
+    if log_file is not None:
+        file_handler = log.FileHandler(f"{log_file}/run.log")
+        file_handler.addFilter(SaveFilter())
+
+        logger.addHandler(file_handler)
+        logger.addHandler(log.StreamHandler())
+
+def generate_new_log_run(name_suffix: str, generate_log_file: bool=True) -> tuple[str, str]:
+    name_suffix = '_' + name_suffix if name_suffix else ''
+    run_id = time.asctime().replace(" ", "_").replace(":", "-")
+
+    model_savedir = f"{config.LOG_DIR}/RUN_{run_id}{name_suffix}"
+
+    if generate_log_file:
+        os.makedirs(model_savedir, exist_ok=True)
+
+    return run_id, model_savedir
 
 def set_all_seeds(seed: int = 42) -> None:    
     # Basic Python random

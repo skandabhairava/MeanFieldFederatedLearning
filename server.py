@@ -1,6 +1,7 @@
 import time
 import random
 import logging as log
+from functools import reduce
 
 import ray
 import torch
@@ -15,8 +16,6 @@ import data
 import topology
 import comparision_algorithms
 
-import attacks_2 as attacks
-
 import copy
 import math
 
@@ -26,7 +25,15 @@ class Server:
     def __init__(self, model: torch.nn.Module, client_types: list[str], client_splits: list[data.ClientSplit], num_clients: int, seed: int):
         self.model = model
 
-        self.proj_dim = 20
+        if config.USE_VELOCITY:
+            self.total_proj_dim = 20
+            self.proj_dim = 5
+            self.zero_proj = torch.zeros((5,))
+        else:
+            # self.total_proj_dim = 20
+            self.proj_dim = 20
+            # self.zero_proj = torch.zeros((5,))
+
 
         log.info("starting server...")
         D = sum(p.numel() for p in self.model.state_dict().values())
@@ -40,7 +47,6 @@ class Server:
 
         self.clients = [
             client.Client(i, client_splits, self.project, model.state_dict(), client_types[i], seed=config.RANDOM_SEED) # pyright: ignore[reportArgumentType]
-            #client.Client(i, client_splits, model.state_dict(), client_types[i], seed=config.RANDOM_SEED) # pyright: ignore[reportArgumentType]
             for i in range(num_clients)
         ]
         self.clients.sort(key=lambda c: c.cid)
@@ -53,144 +59,225 @@ class Server:
     def dist_func(self, client_model_state: torch.Tensor, global_model_state: torch.Tensor) -> float:
         return torch.norm(global_model_state - client_model_state, p=2).item()
     
-    def project(self, vec: torch.Tensor) -> torch.Tensor:
-        return (vec @ self.R)
+    def project(self, vec: torch.Tensor, old_proj: torch.Tensor|None=None, shift_diffs: bool=False, add_to_current_diff: bool=False) -> torch.Tensor:
+        if not config.USE_VELOCITY:
+            return (vec @ self.R)
 
-    def train(self, dataset: Dataset, name_suffix: str='') -> str:
+        if old_proj is None:
+            return torch.cat([vec @ self.R, self.zero_proj, self.zero_proj, self.zero_proj])
+
+        if not shift_diffs:
+            new = (vec @ self.R)
+            if add_to_current_diff:
+                diff = new - old_proj[:self.proj_dim]
+                old_proj[(self.total_proj_dim - self.proj_dim) : self.total_proj_dim] += diff
+
+            old_proj[:self.proj_dim] = new
+            return old_proj
+
+        new = (vec @ self.R)
+        diff = new - old_proj[:self.proj_dim]
+        old_proj[:self.proj_dim] = (vec @ self.R)
+
+        for i in range(1, self.total_proj_dim//self.proj_dim - 1):
+            old_proj[(i*self.proj_dim) : (i*self.proj_dim + self.proj_dim)] = old_proj[(i*self.proj_dim + self.proj_dim): (i*self.proj_dim + 2*self.proj_dim)]
+
+        old_proj[(self.total_proj_dim - self.proj_dim) : self.total_proj_dim] = diff
+
+        return old_proj
+
+    def train(self, dataset: Dataset, run_id: str, log_save_dir: str, save: bool = False, test_run_calc:bool=False) -> str:
+
+        dataset_ref = dataset
+        batch_size = config.BATCH_SIZE
+        device = config.DEVICE
+        if not test_run_calc:
+            dataset_ref = ray.put(dataset)
+            batch_size = ray.put(config.BATCH_SIZE)
+            device = ray.put(config.DEVICE)
+
+            log.info("Preparing attacks", extra={"save": True})
+
+            for c in self.clients:
+                if c.attack is not None:
+                    c.attack.prepare(self.model.state_dict(), models.get_model, dataset, c.split) # pyright: ignore[reportArgumentType]
         
-        name_suffix = '_' + name_suffix if name_suffix else ''
-        run_id = time.asctime().replace(" ", "_").replace(":", "-")
-
-        dataset_ref = ray.put(dataset)
-        batch_size = ray.put(config.BATCH_SIZE)
-        device = ray.put(config.DEVICE)
-
-        for c in self.clients:
-            if c.attack is not None:
-                c.attack.prepare(self.model.state_dict(), models.get_model) # pyright: ignore[reportArgumentType]
+        bigo_ts = []
+        bigo_ss = []
 
         for round_id in range(1, config.ROUNDS+1):
-            log.info(f"{round_id}/{config.ROUNDS}: ")
-            # client_accs = self.round_fed_attract(round_id, run_id, dataset_ref, batch_size, device)
-            # client_accs = self.round_fed_avg(round_id, run_id, dataset_ref, batch_size, device)
-            # client_accs = self.round_fed_krum(round_id, run_id, dataset_ref, batch_size, device)
-            client_accs = self.round_fed_cap(round_id, run_id, dataset_ref, batch_size, device)
+            log.info(f"{round_id}/{config.ROUNDS}: ", extra={"save": True})
+            time_taken, client_accs, bigo_t, bigo_s = self.round_fed_attract(round_id, run_id, dataset_ref, batch_size, device, test_run_calc)
+            # time_taken, client_accs, bigo_t, bigo_s = self.round_fed_avg(round_id, run_id, dataset_ref, batch_size, device)
+            # time_taken, client_accs, bigo_t, bigo_s = self.round_fed_krum(round_id, run_id, dataset_ref, batch_size, device)
+            # time_taken, client_accs, bigo_t, bigo_s = self.round_fed_cap(round_id, run_id, dataset_ref, batch_size, device, test_run_calc)
 
-            acc = stats.avg(client_accs)
-            log.info(f"\tAccuracy: {acc*100:.2f}% | {len(client_accs)} total clients evaluated.")
-            # log.info(f"\tMean Dist from Center: {self.global_cluster.ema_mean} | Std: {self.global_cluster.ema_var**0.5}")
+            if not test_run_calc:
+                log.info(f"Time taken to train: {time_taken[0]}s, accuracy: {time_taken[2]}", extra={"save": True})
+
+            log.info(f"Big O time: {bigo_t} | Big O space: {bigo_s} | Time taken algorithm model: {time_taken[1]}", extra={"save": True})
+            bigo_ts.append(bigo_t)
+            bigo_ss.append(bigo_s)
+
+            if not test_run_calc:
+                acc = stats.avg(client_accs)
+                log.info(f"\tAccuracy: {acc*100:.2f}% | {len(client_accs)} total clients evaluated.", extra={"save": True})
+
             self.global_cluster.print_tree()
 
-        return f"{config.LOG_DIR}/RUN_{run_id}{name_suffix}"
+            # for c in self.clients:
+            #     if c.attack is not None:
+            #         c.attack.communicate(...)
 
-    def round_fed_attract(self, round_id, run_id, dataset_ref: Dataset, batch_size, device) -> list[float]:
-        m = int(len(self.clients) * config.CLIENT_FRAC)
-        selected = random.sample(self.clients, m)
+            if not test_run_calc:
+                if round_id % 10 == 0 and round_id != config.ROUNDS:
+                    time.sleep(60*10)
+ 
+        avg_big_ot = stats.avg(bigo_ts) # pyright: ignore[reportPossiblyUnboundVariable]
+        avg_big_os = stats.avg(bigo_ss) # pyright: ignore[reportPossiblyUnboundVariable]
+        log.info(f"\tAvg BigO time: {avg_big_ot} | Avg BigO space: {avg_big_os}", extra={"save": True})
+        log.info(f"\tMax BigO time: {max(bigo_ts)} | Max BigO space: {max(bigo_ss)}", extra={"save": True}) # pyright: ignore[reportPossiblyUnboundVariable]
+        log.info(f"\tTotal BigO time: {sum(bigo_ts)}", extra={"save": True}) # pyright: ignore[reportPossiblyUnboundVariable]
 
-        start = time.time()
-        futures = [c.train(dataset_ref, batch_size, device) for c in selected]
-        local_sds__cid = ray.get(futures)
-        log.info(f"\t\tTime taken to train: {time.time() - start}")
+        if save and not test_run_calc:
+            for c in self.clients:
+                c.save(log_save_dir)
 
-        updated_states = {cid: sd[0] for sd, cid in local_sds__cid}
+            self.global_cluster.save_metadata(log_save_dir, "topology")
 
-        start = time.time()
-        for sd, cid in local_sds__cid:
-            self.clients[cid].model_state = sd[0]
-            self.clients[cid].model_state_flattened = self.project(stats.flatten(sd[0]))
-        log.info(f"\t\tTime taken to copy updates: {time.time() - start}")
+        return log_save_dir
 
-        if round_id % 5 == 0:
-            start = time.time()
-            self.global_cluster.split()
-            log.info(f"\t\tTime taken to Split: {time.time() - start}")
+    def round_fed_attract(self, round_id, run_id, dataset_ref: Dataset, batch_size, device, test_run_calc:bool=False) -> tuple[tuple[float, float, float], list[float], int, int]:
+        bigo_t = 0
+        bigo_s = 0
+        if not test_run_calc:
+            m = int(len(self.clients) * config.CLIENT_FRAC)
+            selected = random.sample(self.clients, m)
 
-        start = time.time()
-        self.global_cluster.update_centers_upward(updated_states)
-        log.info(f"\t\tTime taken to update : {time.time() - start}")
+            train_start = time.time()
+            futures = [c.train(dataset_ref, batch_size, device, round_id) for c in selected]
+            local_sds__cid = ray.get(futures)
 
-        start = time.time()
-        self.global_cluster.propagate_downward()
-        log.info(f"\t\tTime taken to propagate downwards: {time.time() - start}")
+            for sd, cid in local_sds__cid:
+                self.clients[cid].model_state = sd[0]
+                self.clients[cid].model_state_flattened = self.project(
+                    stats.flatten(sd[0]),
+                    old_proj=self.clients[cid].model_state_flattened,
+                    shift_diffs=True
+                )
+            # log.info(f"\t\tTime taken to copy updates: {time.time() - start}")
 
-        log.info("Finished training. Starting Eval")
+            train_end = time.time()
 
-        accs = ray.get([c.evaluate(dataset_ref, batch_size, device) for c in self.clients if c.client_type == client.ClientTypes.NORMAL]) # list[tuple[float, client_id#int]]
+            updated_states = {cid: sd[0] for sd, cid in local_sds__cid}
+        else:
+            updated_states = {c.cid: c.model_state for c in self.clients}
 
-        accs.sort(key=lambda x: x[1])
-        accs_, _ = zip(*accs)
+        alg_start = time.time()
+        if round_id % config.ATTRACT_SPLIT_EVERY == 0:
+            bigo_t += self.global_cluster.split()
 
-        accs_lis = list(accs_)
+        bigo_t += self.global_cluster.update_centers_upward(updated_states, use_softmax=False)
+        bigo_s += self.global_cluster.propagate_downward()
+        alg_end = time.time()
 
-        return accs_lis
+        if not test_run_calc:
+            log.info("Finished training. Starting Eval")
+            acc_start = time.time()
+            accs = ray.get([c.evaluate(dataset_ref, batch_size, device) for c in self.clients if c.client_type == client.ClientTypes.NORMAL]) # list[tuple[float, client_id#int]]
+            acc_end = time.time()
+
+            accs.sort(key=lambda x: x[1])
+            # accs_, _, counters = zip(*accs)
+            accs_, _, counters = zip(*accs)
+
+            if counters[0] is not None:
+                final_counter = reduce(lambda x, y: x+y, counters)
+                log.info(final_counter)
+
+            accs_lis = list(accs_)
+
+        if test_run_calc:
+            return (0, alg_end-alg_start, 0), [], bigo_t, bigo_s
+        return (train_end-train_start, alg_end-alg_start, acc_end-acc_start), accs_lis, bigo_t, bigo_s # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
     
-    def round_fed_avg(self, round_id, run_id, dataset_ref: Dataset, batch_size, device) -> list[float]:
+    def round_fed_avg(self, round_id, run_id, dataset_ref: Dataset, batch_size, device) -> tuple[tuple[float, float, float], list[float]]:
         m = int(len(self.clients) * config.CLIENT_FRAC)
         selected = random.sample(self.clients, m)
 
-        start = time.time()
-        futures = [c.train(dataset_ref, batch_size, device) for c in selected]
+        train_start = time.time()
+        futures = [c.train(dataset_ref, batch_size, device, round_id) for c in selected]
         local_sds__cid = ray.get(futures)
-        log.info(f"\t\tTime taken to train: {time.time() - start}")
+        train_end = time.time()
 
         updated_states = [(cid, sd[0]) for sd, cid in local_sds__cid]
 
+        alg_start = time.time()
         new_global = topology.Cluster.avg_model_states(updated_states)
+        alg_end = time.time()
 
-        start = time.time()
+        # start = time.time()
         for c in self.clients:
             c.model_state = new_global
             # DONT NEED THIS: c.model_state_flattened = self.project(stats.flatten(sd[0]))
-        log.info(f"\t\tTime taken to copy updates: {time.time() - start}")
+        # log.info(f"\t\tTime taken to copy updates: {time.time() - start}")
 
         log.info("Finished training. Starting Eval")
 
+        acc_start = time.time()
         accs = ray.get([c.evaluate(dataset_ref, batch_size, device) for c in self.clients if c.client_type == client.ClientTypes.NORMAL]) # list[tuple[float, client_id#int]]
+        acc_end = time.time()
         
         # accs.sort(key=lambda x: x[1])
-        accs_, _ = zip(*accs)
+        accs_, _, _ = zip(*accs)
 
         accs_lis = list(accs_)
 
-        return accs_lis
+        return (train_end-train_start, alg_end-alg_start, acc_end-acc_start), accs_lis
     
-    def round_fed_krum(self, round_id, run_id, dataset_ref: Dataset, batch_size, device) -> list[float]:
+    def round_fed_krum(self, round_id, run_id, dataset_ref: Dataset, batch_size, device) -> tuple[tuple[float, float, float], list[float]]:
         m = int(len(self.clients) * config.CLIENT_FRAC)
         selected = random.sample(self.clients, m)
 
-        start = time.time()
-        futures = [c.train(dataset_ref, batch_size, device) for c in selected]
+        train_start = time.time()
+        futures = [c.train(dataset_ref, batch_size, device, round_id) for c in selected]
         local_sds__cid = ray.get(futures)
-        log.info(f"\t\tTime taken to train: {time.time() - start}")
+        train_end = time.time()
 
         updated_states = [(cid, sd[0]) for sd, cid in local_sds__cid]
 
         # new_global = topology.Cluster.avg_model_states(updated_states)
-        new_global = comparision_algorithms.krum_aggregate_adaptive(updated_states)
 
-        start = time.time()
+        alg_start = time.time()
+        new_global = comparision_algorithms.krum_aggregate_adaptive(updated_states)
+        alg_end = time.time()
+
+        # start = time.time()
         for c in self.clients:
             c.model_state = new_global
             # DONT NEED THIS: c.model_state_flattened = self.project(stats.flatten(sd[0]))
-        log.info(f"\t\tTime taken to copy updates: {time.time() - start}")
+        # log.info(f"\t\tTime taken to copy updates: {time.time() - start}")
 
         log.info("Finished training. Starting Eval")
 
+        acc_start = time.time()
         accs = ray.get([c.evaluate(dataset_ref, batch_size, device) for c in self.clients if c.client_type == client.ClientTypes.NORMAL]) # list[tuple[float, client_id#int]]
+        acc_end = time.time()
         
         # accs.sort(key=lambda x: x[1])
-        accs_, _ = zip(*accs)
+        accs_, _, _ = zip(*accs)
 
         accs_lis = list(accs_)
 
-        return accs_lis
+        return (train_end-train_start, alg_end-alg_start, acc_end-acc_start), accs_lis
     
-    def round_fed_cap(self, round_id, run_id, dataset_ref, batch_size, device) -> list[float]:
+    def round_fed_cap(self, round_id, run_id, dataset_ref, batch_size, device, test_run_calc:bool=False) -> tuple[tuple[float, float, float], list[float], int, int]:
         """
         FedCAP: Robust Federated Learning via Customized Aggregation and Personalization
         Implements server-side customization, calibration, and anomaly detection.
         """
-        
+        bigo_t = 0
+        bigo_s  = 0
         # Initialize FedCAP state containers on first round
         if round_id == 1:
             self.recovered_model_pool: dict[int, models.StateDict] = {}      # Stores \tilde{w}^{t-1} from previous round
@@ -206,7 +293,8 @@ class Server:
         # Client selection
         m = int(len(self.clients) * config.CLIENT_FRAC)
         selected = random.sample(self.clients, m)
-        selected_cids = {c.cid for c in selected}
+
+        alg_start = time.time()
         
         # =========================================================================
         # STEP 1: Global Model Update (using previous round's recovered models)
@@ -245,9 +333,11 @@ class Server:
                     for other_cid, other_d_flat in self.calibrated_update_pool.items():
                         if other_cid == cid or other_cid in self.detected_malicious:
                             continue
+                        bigo_t += 1
+
                         sim = self._cosine_similarity_flat(d_k_flat, other_d_flat)
                         similarities[other_cid] = sim
-                    
+
                     # Compute aggregation weights with softmax normalization (Eq. 5)
                     weights = self._compute_customized_weights(
                         cid, similarities, self.fedcap_alpha, self.fedcap_phi
@@ -266,9 +356,16 @@ class Server:
             # Load customized model into client
             c.model_state = copy.deepcopy(customized_models[c.cid])
         
-        futures = [c.train(dataset_ref, batch_size, device) for c in selected]
-        local_results_pre = ray.get(futures)  # List of (state_dict, cid)
-        local_results = [(i[0][0], i[1]) for i in local_results_pre]
+        alg_pause = time.time()
+
+        if not test_run_calc:
+            train_start = time.time()
+            futures = [c.train(dataset_ref, batch_size, device, round_id) for c in selected]
+            local_results_pre = ray.get(futures)  # List of (state_dict, cid)
+            train_end = time.time()
+            local_results = [(i[0][0], i[1]) for i in local_results_pre]
+
+        alg_continue = time.time()
         
         # =========================================================================
         # STEP 4: Recovery and Calibration (Section V-C)
@@ -276,31 +373,48 @@ class Server:
         # Calibration: \tilde{d}_k^t = \tilde{w}_k^t - w^t (aligned to global reference)
         # =========================================================================
         recovered_models = {}      # \tilde{w}_k^t
-        calibrated_updates = {}    # Flattened \tilde{d}_k^t
-        
-        for state_dict, cid in local_results:
-            # Recovery: the returned state is the recovered model
-            recovered_models[cid] = state_dict
+        calibrated_updates: dict[int, torch.Tensor] = {}    # Flattened \tilde{d}_k^t
+
+        if not test_run_calc:
+            for state_dict, cid in local_results: # pyright: ignore[reportPossiblyUnboundVariable]
+                # Recovery: the returned state is the recovered model
+                recovered_models[cid] = state_dict
+                
+                # Calibration: difference between recovered model and current global model
+                diff_state = self._state_diff(state_dict, self.global_model_state)
+                calibrated_updates[cid] = stats.flatten(diff_state) # pyright: ignore[reportArgumentType]
+        else:
+            for client_ in self.clients:
+                recovered_models[client_.cid] = client_.model_state
+                diff_state = self._state_diff(client_.model_state, self.global_model_state)
+                calibrated_updates[client_.cid] = stats.flatten(diff_state) # pyright: ignore[reportArgumentType]
             
-            # Calibration: difference between recovered model and current global model
-            diff_state = self._state_diff(state_dict, self.global_model_state)
-            calibrated_updates[cid] = stats.flatten(diff_state) # pyright: ignore[reportArgumentType]
-        
         # =========================================================================
         # STEP 5: Anomaly Detection (Section V-C)
         # Detect malicious clients by thresholding Euclidean norm of calibrated updates
         # =========================================================================
+        avg = stats.flatten(self.global_model_state)
+        direction = avg / avg.norm()
+        avg_coord = torch.dot(avg, direction).item()
+
+        log.info(f"\tGLOBAL: {avg_coord}")
+
         newly_detected = []
         for cid, cal_flat in calibrated_updates.items():
             if cid in self.detected_malicious:
                 continue
+
+            bigo_t += 1
             norm = torch.norm(cal_flat).item()
             if norm > self.fedcap_T_norm:
                 self.detected_malicious.add(cid)
                 newly_detected.append((cid, norm))
+
+            upd = cal_flat + avg
+            log.info(f"{cid=} {torch.dot(upd.flatten(), direction).item()} {norm=}")
         
         if newly_detected:
-            log.info(f"Round {round_id}: Detected and removed malicious clients: {newly_detected}")
+            log.info(f"Round {round_id}: Detected and removed malicious clients: {newly_detected}  {len(newly_detected)=}", extra={"save": True})
         
         # =========================================================================
         # STEP 6: Update Historical Pools for next round
@@ -320,20 +434,26 @@ class Server:
         # =========================================================================
         # STEP 7: Evaluation (only benign clients)
         # =========================================================================
-        benign_clients = [
-            c for c in self.clients 
-            if c.client_type == client.ClientTypes.NORMAL
-        ]
         
-        if not benign_clients:
-            log.warning(f"Round {round_id}: No benign clients remaining for evaluation")
-            return []
-        
-        eval_futures = [c.evaluate(dataset_ref, batch_size, device) for c in benign_clients]
-        eval_results = ray.get(eval_futures)
-        # eval_results.sort(key=lambda x: x[1])
-        accs, _ = zip(*eval_results)
-        return list(accs)
+        alg_end = time.time()
+
+        if not test_run_calc:
+            acc_start = time.time()
+            eval_futures = [
+                c.evaluate(dataset_ref, batch_size, device) 
+                for c in self.clients
+                if c.client_type == client.ClientTypes.NORMAL
+            ]
+            eval_results = ray.get(eval_futures)
+            acc_end = time.time()
+            # eval_results.sort(key=lambda x: x[1])
+            accs, _, _ = zip(*eval_results)
+
+        bigo_s = len(self.calibrated_update_pool) + len(self.recovered_model_pool)
+
+        if test_run_calc:
+            return (0, (alg_end-alg_continue)+(alg_pause-alg_start), 0), [], bigo_t, bigo_s # pyright: ignore[reportPossiblyUnboundVariable]
+        return (train_end-train_start, (alg_end-alg_continue)+(alg_pause-alg_start), acc_end-acc_start), list(accs), bigo_t, bigo_s # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
 
 
     # =============================================================================
@@ -356,6 +476,10 @@ class Server:
         - target_cid gets weight phi (self-contribution)
         - Others share (1-phi) weighted by exp(alpha * similarity)
         """
+
+        # alpha = 5
+        # phi = 0.2
+
         if not similarities:
             return {target_cid: 1.0}
         

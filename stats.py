@@ -6,7 +6,7 @@ from models import StateDict
 from typing import Iterable
 
 def avg(iterator: Iterable[float|int]):
-    t = 0
+    t = 1e-12
     sum = 0
     for item in iterator:
         sum += item

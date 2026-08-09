@@ -1,112 +1,116 @@
-import threading
 import numpy as np
 import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.spatial.distance import pdist, squareform
+from scipy.cluster.hierarchy import dendrogram, linkage
 from matplotlib.ticker import MaxNLocator
-from scipy.spatial.distance import jensenshannon
-from scipy.stats import entropy
+import threading
+from typing import List, Optional
 
-
-def analyze_splits_async(dataset, splits, num_classes=10):
+def analyze_feature_similarity(
+    full_features: np.ndarray,
+    client_indices: List[List[int]],
+    distance_metric: str = 'euclidean',
+    linkage_method: str = 'average',
+    plot_heatmap: bool = True,
+    plot_dendrogram: bool = True,
+    save_prefix: Optional[str] = None,
+    run_async: bool = False
+) -> Optional[threading.Thread]:
     """
-    Runs dataset distribution analysis in a background thread.
-
-    Args:
-        dataset: PyTorch dataset
-        splits: list of (train_indices, test_indices)
-        num_classes: number of classes
-        save_dir: where to save outputs
+    Analyze client similarity based on feature centroids.
     """
-
     def _run():
-        print("[Analyzer] Starting...")
-
-        # os.makedirs(save_dir, exist_ok=True)
-
-        # -------------------------
-        # Fast label access (important optimization)
-        # -------------------------
-        if hasattr(dataset, "targets"):
-            all_labels = np.array(dataset.targets)
-            get_labels = lambda idx: all_labels[idx]
+        # Compute centroids
+        centroids = []
+        for idxs in client_indices:
+            if len(idxs) > 0:
+                centroid = full_features[idxs].mean(axis=0)
+            else:
+                centroid = np.zeros(full_features.shape[1])
+            centroids.append(centroid)
+        centroids = np.array(centroids)
+        n_clients = len(centroids)
+        
+        # Compute pairwise distance matrix
+        if distance_metric == 'cosine':
+            norms = np.linalg.norm(centroids, axis=1, keepdims=True)
+            norms[norms == 0] = 1
+            centroids_norm = centroids / norms
+            sim = centroids_norm @ centroids_norm.T
+            dist_matrix = 1 - sim
+        elif distance_metric == 'euclidean':
+            dist_matrix = squareform(pdist(centroids, metric='euclidean'))
         else:
-            get_labels = lambda idx: np.array([dataset[i][1] for i in idx])
-
-        # -------------------------
-        # Compute distributions
-        # -------------------------
-        distributions = []
-        for train_idx, _ in splits:
-            labels = get_labels(train_idx)
-            count = np.bincount(labels, minlength=num_classes)
-            prob = count / max(count.sum(), 1)
-            distributions.append(prob)
-
-        distributions = np.array(distributions)
-
-        # -------------------------
-        # Plot label distribution
-        # -------------------------
-        plt.figure()
-        plt.imshow(distributions, aspect='auto')
-        plt.colorbar()
-        plt.xlabel("Class")
-        plt.ylabel("Client")
-        plt.title("Label Distribution per Client")
-        plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
-        plt.gca().yaxis.set_major_locator(MaxNLocator(integer=True))
-        # plt.savefig(os.path.join(save_dir, "label_distribution.png"))
-        plt.show()
-
-        # -------------------------
-        # Compute distance matrix
-        # -------------------------
-        n = len(distributions)
-        dist_matrix = np.zeros((n, n))
-
-        for i in range(n):
-            for j in range(n):
-                dist_matrix[i, j] = jensenshannon(
-                    distributions[i], distributions[j]
-                )
-
-        # -------------------------
-        # Plot similarity
-        # -------------------------
-        plt.figure()
-        plt.imshow(dist_matrix)
-        plt.colorbar()
-        plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
-        plt.gca().yaxis.set_major_locator(MaxNLocator(integer=True))
-        plt.title("Client Similarity (JS Distance)")
-        # plt.savefig(os.path.join(save_dir, "client_similarity.png"))
-        plt.show()
-
-        # -------------------------
-        # Metrics
-        # -------------------------
-        global_dist = distributions.mean(axis=0)
-
-        entropies = np.array([entropy(p) for p in distributions])
-        non_iid_scores = np.array([
-            jensenshannon(p, global_dist) for p in distributions
-        ])
-
-        # -------------------------
-        # Save everything
-        # -------------------------
-        # np.save(os.path.join(save_dir, "distributions.npy"), distributions)
-        # np.save(os.path.join(save_dir, "distance_matrix.npy"), dist_matrix)
-        # np.save(os.path.join(save_dir, "entropy.npy"), entropies)
-        # np.save(os.path.join(save_dir, "non_iid_score.npy"), non_iid_scores)
-
+            raise ValueError(f"Unknown distance metric: {distance_metric}")
+        
+        # Ensure diagonal is exactly zero (fix floating point errors)
+        np.fill_diagonal(dist_matrix, 0.0)
+        
+        # Plot heatmap (using similarity = 1 - distance for cosine, or negative distance for euclidean)
+        if plot_heatmap:
+            plt.figure(figsize=(12, 10))
+            if distance_metric == 'cosine':
+                similarity = 1 - dist_matrix
+            else:
+                # For euclidean, convert to similarity using negative distance (or inverse)
+                similarity = -dist_matrix
+            sns.heatmap(similarity, cmap='viridis', annot=False, square=True,
+                        xticklabels=[f"C{i}" for i in range(n_clients)],
+                        yticklabels=[f"C{i}" for i in range(n_clients)],
+                        cbar_kws={'label': 'Similarity'})
+            plt.title(f'Client Similarity (1 - {distance_metric} distance)')
+            if save_prefix:
+                plt.savefig(f"{save_prefix}_heatmap.png", dpi=150, bbox_inches='tight')
+            plt.show()
+        
+        # Hierarchical clustering dendrogram
+        if plot_dendrogram:
+            # Convert distance matrix to condensed form
+            # For cosine, we already have square matrix; for euclidean, we have square as well.
+            # Use squareform with checks disabled or just extract upper triangle.
+            condensed = squareform(dist_matrix, checks=False)  # checks=False avoids diagonal check
+            Z = linkage(condensed, method=linkage_method)
+            
+            plt.figure(figsize=(14, 7))
+            # Generate labels
+            labels = [f"Client {i}" for i in range(n_clients)]
+            # Plot dendrogram with rotated labels
+            dendrogram(Z, labels=labels, leaf_rotation=90, leaf_font_size=8)
+            plt.title(f'Client Hierarchy (linkage={linkage_method}, metric={distance_metric})')
+            plt.xlabel('Client')
+            plt.ylabel('Distance')
+            plt.tight_layout()
+            if save_prefix:
+                plt.savefig(f"{save_prefix}_dendrogram.png", dpi=150, bbox_inches='tight')
+            plt.show()
+        
+        # Additional metrics
+        intra_var = []
+        for idxs in client_indices:
+            if len(idxs) > 1:
+                feat_client = full_features[idxs]
+                centroid = centroids[len(intra_var)]
+                var = np.mean(np.sum((feat_client - centroid)**2, axis=1))
+                intra_var.append(var)
+            else:
+                intra_var.append(0.0)
+        
+        triu_indices = np.triu_indices(n_clients, k=1)
+        inter_distances = dist_matrix[triu_indices]
+        
+        print("[Analyzer] Feature similarity results:")
+        print(f"  Distance metric: {distance_metric}")
+        print(f"  Mean inter‑client distance: {np.mean(inter_distances):.4f} ± {np.std(inter_distances):.4f}")
+        print(f"  Min inter‑client distance: {np.min(inter_distances):.4f}")
+        print(f"  Max inter‑client distance: {np.max(inter_distances):.4f}")
+        print(f"  Mean intra‑client variance (first 5): {np.mean(intra_var[:5]):.4f}")
         print("[Analyzer] Done.")
-        print("Entropy (first 5):", entropies[:5])
-        print("Non-IID score (first 5):", non_iid_scores[:5])
-
-    # -------------------------
-    # Run in background thread
-    # -------------------------
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
-
-    return thread
+    
+    if run_async:
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        return thread
+    else:
+        _run()
+        return None

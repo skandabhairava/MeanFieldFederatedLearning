@@ -1,11 +1,13 @@
 import torch
 import models
 import torch.nn.functional as F
+from torch import optim
 
-import logging as log
 import hashlib
+import data
 import random
 import copy
+import config
 
 # log = logging.getLogger("attacks")
 
@@ -14,62 +16,92 @@ class Attack:
         self.name = name
         self.prepared = False
 
-    def manipulate_update(self, update: torch.Tensor, global_layer: torch.Tensor, param_name: str|None=None) -> torch.Tensor:
+    def manipulate_update(self, update: torch.Tensor, global_layer: torch.Tensor, param_name: str|None=None, round_id: int|None=None) -> torch.Tensor:
         return update
     
-    def prepare(self, ref_state_dict: models.StateDict, model: type[torch.nn.Module]) -> None:
+    def prepare(self, ref_state_dict: models.StateDict, model: type[torch.nn.Module], dataset, split) -> None:
         self.prepared = True
+
+    def apply(self, x: torch.Tensor, y: torch.Tensor, modify_y: bool=False) -> tuple[torch.Tensor, torch.Tensor]:
+        return x, y
+
+    def communicate(self, **msgs) -> None:
+        # make use of static class vars to communicate sequentially
+        # msgs can be anything needed to communicate.
+        return
 
 class SubtleALIEAttack(Attack):
     layer_names_affected = []
+    direction: dict[str, torch.Tensor] = {}  # will be filled in prepare()
 
-    def __init__(self, name: str, epsilon: float = 0.001):
+    def __init__(self, name: str, sample: float = 1.0):
         super().__init__(name)
-        self.epsilon = epsilon
+        # self.epsilon = epsilon
         self.global_sd = {}
         self.shared_seed = None      # will be set in prepare
-        self.sample = 0.3       # used only during prepare (read‑only later)
+        self.sample = sample       # used only during prepare (read‑only later)
         self.copy_layer_names_affected = []
 
-    def prepare(self, ref_state_dict: models.StateDict, model: type[torch.nn.Module]):
+    def prepare(self, ref_state_dict: models.StateDict, model: type[torch.nn.Module], dataset, split):
         """
         Called once per malicious client before any training.
-        We use a fixed seed derived from the attack name (or a pre‑shared value)
+        We use a fixed seed derived from the attack name (or a pre-shared value)
         so that all colluding clients generate the same sign pattern.
         """
-        super().prepare(ref_state_dict, model)
+        super().prepare(ref_state_dict, model, dataset, split)
         # Generate a shared, deterministic seed from the attack name.
         # In practice this could be a pre‑agreed integer.
         seed_int = int(hashlib.md5(self.name.encode()).hexdigest()[:8], 16)
         self.shared_seed = seed_int
 
-        if len(SubtleALIEAttack.layer_names_affected) == 0:
+        if len(SubtleALIEAttack.layer_names_affected) == 0 and self.sample != 1.0:
             # random.choices(list(ref_state_dict.keys()))
             layers = list(ref_state_dict.keys())
             SubtleALIEAttack.layer_names_affected = random.sample(layers, int(self.sample * len(layers)))
 
+        if len(SubtleALIEAttack.direction) == 0:
+            m = model()
+            opt = optim.SGD(m.parameters(), lr=config.LR)
+            m.train()
+            
+            # x: torch.Tensor
+            # y: torch.Tensor
+        
+            old_sd = m.cpu().state_dict()
+            m.to(config.DEVICE)
 
-        self.copy_layer_names_affected = copy.deepcopy(SubtleALIEAttack.layer_names_affected)
-        # log.info(f"{self.copy_layer_names_affected}")
+            train_loader = data.build_client_loaders(dataset, split, config.BATCH_SIZE, True)
+            for _ in range(config.LOCAL_EPOCHS):
+                for x, y in train_loader:
+                    x, y = x.to(config.DEVICE), y.to(config.DEVICE)
+        
+                    opt.zero_grad()
+                    loss = F.cross_entropy(m(x), y)
+                    loss.backward()
+                    opt.step()
+            
+            new_sd = m.cpu().state_dict()
 
-    # def __getstate__(self):
-    #     print("SERIALIZING:", self.copy_layer_names_affected)
-    #     return self.__dict__
+            for name, new_tensor in new_sd.items():
 
-    # def __setstate__(self, state):
-    #     print("DESERIALIZING:", state.get("copy_layer_names_affected"))
-    #     self.__dict__.update(state)
+                if self.sample != 1.0 and name not in SubtleALIEAttack.layer_names_affected:
+                    continue
+
+                SubtleALIEAttack.direction[name] = -15 * 2 * (new_tensor - old_sd[name])
+
+        if self.sample != 1.0:
+            self.copy_layer_names_affected = copy.deepcopy(SubtleALIEAttack.layer_names_affected)
+
+        self.copy_direction = copy.deepcopy(SubtleALIEAttack.direction)
+        # print(self.copy_direction)
 
     def manipulate_update(self,
                           update: torch.Tensor,
                           global_layer: torch.Tensor,
-                          param_name: str|None = None) -> torch.Tensor:
+                          param_name: str|None = None,
+                          round_id: int|None=None) -> torch.Tensor:
         """
-        Apply the subtle ALIE perturbation.
-
-        - Sign is derived from a hash of (shared_seed + param_name).
-        - Magnitude = epsilon * ||global_layer|| (small relative change).
-        - The perturbation is added to the original update.
+        Apply the subtle perturbation.
         """
         if not self.prepared :
             raise Exception()
@@ -77,126 +109,113 @@ class SubtleALIEAttack(Attack):
         if param_name is None:
             raise ValueError("param_name must be provided for coordinated sign computation")
         
-        if param_name not in self.copy_layer_names_affected:
+        if self.sample != 1.0 and param_name not in self.copy_layer_names_affected:
             return update
         
         # print(f"ATTACK DEBUG: {param_name=}")
         # raise Exception(f"{param_name=}")
 
         # Deterministic sign shared by all malicious clients for this layer.
-        sign_seed = f"{self.shared_seed}_{param_name}"
-        sign_hash = int(hashlib.md5(sign_seed.encode()).hexdigest()[:8], 16)
-        sign = 1.0 if (sign_hash % 2) == 0 else -1.0
+        # manipulated_update = update + self.copy_direction[param_name] * self.epsilon
 
-        # Subtle magnitude: small fraction of the global layer's norm.
-        # Using the global layer's norm ensures the perturbation is
-        # proportional to the parameter scale, blending in naturally.
-        global_norm = torch.norm(global_layer).item()
-        if global_norm == 0:
-            magnitude = self.epsilon
-        else:
-            magnitude = self.epsilon * global_norm
+        manipulated_update = self.copy_direction[param_name]# * 25 * update.norm()
+        
+        # dist = update.norm()
+        # T_norm = 0.5
+        # manipulated_update_size = (1 - ((5*T_norm)/(3*dist)))
+        # manipulated_update = manipulated_update_size * update
+        
+        # if round_id == 1:
+        # manipulated_update = -update
 
-        # Apply perturbation.
-        perturbation = sign * magnitude
-        manipulated_update = update + perturbation
+        # manipulated_update = torch.zeros_like(update)
+        
+
+        # eps = 1e-8
+        # # manipulated_update_scaled = manipulated_update * (update.norm(p=2) / manipulated_update.norm(p=2) + eps)
+
+        # # value = 1
+        # final_value = update.norm(p=2)
+        # final_value = final_value + 0.5*final_value
+
+        # round_id = 10 if round_id is None else round_id
+        # value = max(((round_id-1)*(final_value - 1))/(5) + 1, final_value)
+
+        # print(dist, manipulated_update.norm(), manipulated_update_size, manipulated_update.size())
+
+        # manipulated_update_scaled = manipulated_update * (value / manipulated_update.norm(p=2) + eps)
 
         return manipulated_update
     
-#################################################################
+#####################################################
 
-class CleanLabelPoisoningAttack(Attack):
-    """Clean‑label poisoning – adds a gradient from a trigger sample to the update."""
-    def __init__(self, name: str, target_class: int = 0, trigger_pattern: str|None = None,
-                 strength: float = 1.0, input_shape=(3, 32, 32)):
+class BackdoorAttack(Attack):
+    def __init__(self, name: str, trigger_size: int = 3, poison_fraction: float = 0.3, target_class: int = 0):
         super().__init__(name)
+        self.trigger_size = trigger_size
+        self.poison_fraction = poison_fraction
         self.target_class = target_class
-        self.trigger_pattern = trigger_pattern   # currently unused, kept for future extension
-        self.strength = strength
-        self.input_shape = input_shape
-        self.poison_grads = None
+        self.trigger_pattern: None|torch.Tensor = None   # will be created in prepare()
 
-    def prepare(self, ref_state_dict: models.StateDict, model: type[torch.nn.Module]):
-        # Build a model and load the global state
-        super().prepare(ref_state_dict, model)
-        model_ins = model()
-        model_ins.eval()
-        model_ins.load_state_dict(ref_state_dict, strict=False)
-        model_ins.to('cpu')
-
-        # Create a dummy input with a trigger (white square in bottom‑right corner)
-        C, H, W = self.input_shape
-        dummy = torch.zeros(1, C, H, W)
-        # Place a 3x3 white square in the bottom‑right corner (adjust if H,W < 3)
-        if H >= 3 and W >= 3:
-            dummy[:, :, H-3:H, W-3:W] = 1.0
-
-        target = torch.tensor([self.target_class])
-
-        # Compute gradient of loss w.r.t. model parameters
-        model_ins.zero_grad()
-        output = model_ins(dummy)
-        loss = F.cross_entropy(output, target)
-        loss.backward()
-
-        # Store the gradients using the same keys as the state dict
-        self.poison_grads = {}
-        for name, param in model_ins.named_parameters():
-            if param.grad is not None:
-                self.poison_grads[name] = param.grad.clone()
-
-    def manipulate_update(self, update: torch.Tensor, global_layer: torch.Tensor, param_name: str|None = None) -> torch.Tensor:
-        if not self.prepared :
-            raise Exception()
-
-        if self.poison_grads is None or param_name not in self.poison_grads:
-            return update
-        poison = self.poison_grads[param_name].to(update.device)
-        return update + self.strength * poison
-
-class DistributedCleanLabelPoisoningAttack(CleanLabelPoisoningAttack):
-    """Distributed version – all attackers share the same target class and strength."""
-    _shared_target = None
-    _shared_trigger = None
-    _shared_strength = None
-
-    def prepare(self, ref_state_dict: models.StateDict, model: type[torch.nn.Module]):
-        # Set shared variables once
-        if DistributedCleanLabelPoisoningAttack._shared_target is None:
-            DistributedCleanLabelPoisoningAttack._shared_target = self.target_class
-            DistributedCleanLabelPoisoningAttack._shared_trigger = self.trigger_pattern
-            DistributedCleanLabelPoisoningAttack._shared_strength = self.strength
-        self.target_class = DistributedCleanLabelPoisoningAttack._shared_target
-        self.trigger_pattern = DistributedCleanLabelPoisoningAttack._shared_trigger
-        self.strength = DistributedCleanLabelPoisoningAttack._shared_strength
-        super().prepare(ref_state_dict, model)
-
-##########################################################################
-
-class EdgeCasePoisoningAttack(Attack):
-    """Edge‑case poisoning – scales the client’s update by a constant factor."""
-    def __init__(self, name: str, scale: float = 2.0):
-        super().__init__(name)
+    def prepare(self, ref_state_dict: models.StateDict, model: type[torch.nn.Module], dataset, split) -> None:
+        """Pre-compute the trigger pattern (a white square) once."""
+        # Assuming images are in [0,1] range. For [0,255] use 255.0 instead of 1.0.
+        self.trigger_pattern = torch.full((3, self.trigger_size, self.trigger_size), 1.0)
         self.prepared = True
-        self.scale = scale
 
-    def manipulate_update(self, update: torch.Tensor, global_layer: torch.Tensor, param_name: str|None = None) -> torch.Tensor:
-        if not self.prepared :
+    def apply(self, x: torch.Tensor, y: torch.Tensor, modify_y: bool=False) -> tuple[torch.Tensor, torch.Tensor]:
+        """Add trigger to a random subset of the batch and set their labels to target_class."""
+
+        if not self.prepared or not isinstance(self.trigger_pattern, torch.Tensor):
             raise Exception()
-        return update * self.scale
 
-class DistributedEdgeCasePoisoningAttack(EdgeCasePoisoningAttack):
-    """Distributed version – all attackers use the same scale."""
-    _shared_scale = None
+        batch_size = x.size(0)
+        # Decide which samples to poison
+        poison_mask = torch.rand(batch_size) < 0.3 #self.poison_fraction
 
-    def prepare(self, ref_state_dict: models.StateDict, model: type[torch.nn.Module]):
-        if DistributedEdgeCasePoisoningAttack._shared_scale is None:
-            DistributedEdgeCasePoisoningAttack._shared_scale = self.scale
-        self.scale = DistributedEdgeCasePoisoningAttack._shared_scale
-        super().prepare(ref_state_dict, model)
+        if poison_mask.any():
+            # Add the trigger pattern to the bottom‑right corner of poisoned images
+            x_poisoned = x[poison_mask]
+            # Ensure trigger pattern is on the same device and broadcastable
+            trigger = self.trigger_pattern.to(x.device)
+            # Place trigger at bottom‑right corner
+            x_poisoned[:, :, -self.trigger_size:, -self.trigger_size:] = trigger
+            x[poison_mask] = x_poisoned
 
-attacks_to_prepare: list[type[Attack]] = [
-    SubtleALIEAttack,
-    CleanLabelPoisoningAttack, DistributedCleanLabelPoisoningAttack,
-    EdgeCasePoisoningAttack, DistributedEdgeCasePoisoningAttack
-]
+            if modify_y:
+                y[poison_mask] = self.target_class
+
+        return x, y
+
+
+class LabelSwitchAttack(Attack):
+    label_switch = {}
+
+    def __init__(self, name: str, total_labels: int):
+        super().__init__(name)
+        self.total_labels = total_labels
+
+    def prepare(self, ref_state_dict: models.StateDict, model: type[torch.nn.Module], dataset, split) -> None:
+        """Pre-compute the trigger pattern (a white square) once."""
+        # Assuming images are in [0,1] range. For [0,255] use 255.0 instead of 1.0.
+        labels = list(range(self.total_labels))
+        if len(LabelSwitchAttack.label_switch) == 0:
+            for label, rnd_label in zip(labels, random.sample(labels, k=len(labels))):
+                LabelSwitchAttack.label_switch[label] = rnd_label
+        self.prepared = True
+
+    def apply(self, x: torch.Tensor, y: torch.Tensor, modify_y: bool=False) -> tuple[torch.Tensor, torch.Tensor]:
+        """Add trigger to a random subset of the batch and set their labels to target_class."""
+
+        if not self.prepared:
+            raise Exception()
+
+        # x = torch.tensor([1, 2, 5, 3])
+
+        lut = torch.arange(self.total_labels)
+        for old, new in LabelSwitchAttack.label_switch.items():
+            lut[old] = new
+
+        y = lut[y]
+
+        return x, y
