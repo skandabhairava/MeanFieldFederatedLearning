@@ -10,7 +10,7 @@ from collections import Counter
 import data
 import models
 import config
-import attacks_2
+import attacks
 from data import ClientSplit
 from client_types import ClientTypes
 import stats
@@ -41,14 +41,16 @@ class Client:
 
         self.attack = None
 
-        if client_type == ClientTypes.ALIE:
-            self.attack = attacks_2.SubtleALIEAttack("alie")
+        if client_type == ClientTypes.SUBTLE:
+            self.attack = attacks.SubtleAttack("subtle")
         elif client_type == ClientTypes.BACKDOOR_0:
-            self.attack = attacks_2.BackdoorAttack("backdoor_0", 3, 0.3, 0)
+            self.attack = attacks.BackdoorAttack("backdoor_0", 3, 0.3, 0)
         elif client_type == ClientTypes.BACKDOOR_0_ALL:
-            self.attack = attacks_2.BackdoorAttack("backdoor_0_all", 3, 1, 0)
+            self.attack = attacks.BackdoorAttack("backdoor_0_all", 3, 1, 0)
         elif client_type == ClientTypes.LABEL_SWITCH:
-            self.attack = attacks_2.LabelSwitchAttack("label_switch", 10)
+            self.attack = attacks.LabelSwitchAttack("label_switch", 10)
+        elif client_type == ClientTypes.ALIE:
+            self.attack = attacks.ALIEAttack("label_switch")
 
         if save_log:
             log.info(f"Client {self.cid} has been assigned type: {client_type}", extra={"save": True})
@@ -92,7 +94,7 @@ class Client:
         return list(np.random.choice(names, size=n, p=probs))
 
 @ray.remote(num_cpus=2, num_gpus=0.5)
-def train(global_sd: models.StateDict, split: ClientSplit, dataset: Dataset, batch_size: int, device: str|torch.device, attack: None|attacks_2.Attack, cid: int, round_id: int) -> tuple[ModelState, int]:
+def train(global_sd: models.StateDict, split: ClientSplit, dataset: Dataset, batch_size: int, device: str|torch.device, attack: None|attacks.Attack, cid: int, round_id: int) -> tuple[ModelState, int]:
     model = models.get_model().to(device)
     model.load_state_dict(global_sd)
 
@@ -133,7 +135,7 @@ def evaluate(
         dataset: Dataset,
         batch_size: int,
         device: str|torch.device,
-        attack: None|attacks_2.Attack,
+        attack: None|attacks.Attack,
         calc_counts: bool,
         cid
     ) -> tuple[float, int, Counter[int]|None]:

@@ -31,7 +31,7 @@ CLIENT_TYPES = {
     ClientTypes.NORMAL: 1.0,
 
     # ClientTypes.NORMAL: 0.4,
-    # ClientTypes.ALIE: 0.6,
+    # ClientTypes.SUBTLE: 0.6,
 
     # ClientTypes.NORMAL: 0.4,
     # ClientTypes.BACKDOOR_0: 0.6,

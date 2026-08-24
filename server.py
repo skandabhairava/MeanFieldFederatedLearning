@@ -2,6 +2,7 @@ import time
 import random
 import logging as log
 from functools import reduce
+from enum import Enum
 
 import ray
 import torch
@@ -15,11 +16,18 @@ import models
 import data
 import topology
 import comparision_algorithms
+from client_types import ClientTypes
 
 import copy
 import math
 
 ModelState = tuple[models.StateDict, int]
+
+class TrainProtocol(Enum):
+    FedAttract = 1
+    FedAvg = 2
+    FedKrum = 3
+    FedCap = 4
 
 class Server:
     def __init__(self, model: torch.nn.Module, client_types: list[str], client_splits: list[data.ClientSplit], num_clients: int, seed: int):
@@ -86,7 +94,7 @@ class Server:
 
         return old_proj
 
-    def train(self, dataset: Dataset, run_id: str, log_save_dir: str, save: bool = False, test_run_calc:bool=False) -> str:
+    def train(self, train_protocol: TrainProtocol, dataset: Dataset, run_id: str, log_save_dir: str, save: bool = False, test_run_calc:bool=False) -> str:
 
         dataset_ref = dataset
         batch_size = config.BATCH_SIZE
@@ -105,12 +113,21 @@ class Server:
         bigo_ts = []
         bigo_ss = []
 
+        ALIE_clients = [c for c in self.clients if c.attack == ClientTypes.ALIE]
+
         for round_id in range(1, config.ROUNDS+1):
+            if len(ALIE_clients) != 0:
+                ALIE_clients[0].attack.global_model_state = topology.Cluster.avg_model_states([(c.cid, c.model_state) for c in ALIE_clients])  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
+
             log.info(f"{round_id}/{config.ROUNDS}: ", extra={"save": True})
-            time_taken, client_accs, bigo_t, bigo_s = self.round_fed_attract(round_id, run_id, dataset_ref, batch_size, device, test_run_calc)
-            # time_taken, client_accs, bigo_t, bigo_s = self.round_fed_avg(round_id, run_id, dataset_ref, batch_size, device)
-            # time_taken, client_accs, bigo_t, bigo_s = self.round_fed_krum(round_id, run_id, dataset_ref, batch_size, device)
-            # time_taken, client_accs, bigo_t, bigo_s = self.round_fed_cap(round_id, run_id, dataset_ref, batch_size, device, test_run_calc)
+            if train_protocol == TrainProtocol.FedAttract:
+                time_taken, client_accs, bigo_t, bigo_s = self.round_fed_attract(round_id, run_id, dataset_ref, batch_size, device, test_run_calc)
+            elif train_protocol == TrainProtocol.FedAvg:
+                time_taken, client_accs, bigo_t, bigo_s = self.round_fed_avg(round_id, run_id, dataset_ref, batch_size, device)
+            elif train_protocol == TrainProtocol.FedKrum:
+                time_taken, client_accs, bigo_t, bigo_s = self.round_fed_krum(round_id, run_id, dataset_ref, batch_size, device)
+            elif train_protocol == TrainProtocol.FedCap:
+                time_taken, client_accs, bigo_t, bigo_s = self.round_fed_cap(round_id, run_id, dataset_ref, batch_size, device, test_run_calc)
 
             if not test_run_calc:
                 log.info(f"Time taken to train: {time_taken[0]}s, accuracy: {time_taken[2]}", extra={"save": True})
@@ -125,9 +142,8 @@ class Server:
 
             self.global_cluster.print_tree()
 
-            # for c in self.clients:
-            #     if c.attack is not None:
-            #         c.attack.communicate(...)
+            if len(ALIE_clients) != 0:
+                ALIE_clients[0].attack.perform_alie_attack(self.clients)  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
 
             if not test_run_calc:
                 if round_id % 10 == 0 and round_id != config.ROUNDS:
@@ -143,7 +159,8 @@ class Server:
             for c in self.clients:
                 c.save(log_save_dir)
 
-            self.global_cluster.save_metadata(log_save_dir, "topology")
+            if train_protocol == TrainProtocol.FedAttract:
+                self.global_cluster.save_metadata(log_save_dir, "topology")
 
         return log_save_dir
 
@@ -200,8 +217,8 @@ class Server:
         if test_run_calc:
             return (0, alg_end-alg_start, 0), [], bigo_t, bigo_s
         return (train_end-train_start, alg_end-alg_start, acc_end-acc_start), accs_lis, bigo_t, bigo_s # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
-    
-    def round_fed_avg(self, round_id, run_id, dataset_ref: Dataset, batch_size, device) -> tuple[tuple[float, float, float], list[float]]:
+
+    def round_fed_avg(self, round_id, run_id, dataset_ref: Dataset, batch_size, device) -> tuple[tuple[float, float, float], list[float], int, int]:
         m = int(len(self.clients) * config.CLIENT_FRAC)
         selected = random.sample(self.clients, m)
 
@@ -233,9 +250,10 @@ class Server:
 
         accs_lis = list(accs_)
 
-        return (train_end-train_start, alg_end-alg_start, acc_end-acc_start), accs_lis
-    
-    def round_fed_krum(self, round_id, run_id, dataset_ref: Dataset, batch_size, device) -> tuple[tuple[float, float, float], list[float]]:
+        return (train_end-train_start, alg_end-alg_start, acc_end-acc_start), accs_lis, m, 1
+
+    # time_taken, client_accs, bigo_t, bigo_s    
+    def round_fed_krum(self, round_id, run_id, dataset_ref: Dataset, batch_size, device) -> tuple[tuple[float, float, float], list[float], int, int]:
         m = int(len(self.clients) * config.CLIENT_FRAC)
         selected = random.sample(self.clients, m)
 
@@ -269,7 +287,7 @@ class Server:
 
         accs_lis = list(accs_)
 
-        return (train_end-train_start, alg_end-alg_start, acc_end-acc_start), accs_lis
+        return (train_end-train_start, alg_end-alg_start, acc_end-acc_start), accs_lis, m, 1
     
     def round_fed_cap(self, round_id, run_id, dataset_ref, batch_size, device, test_run_calc:bool=False) -> tuple[tuple[float, float, float], list[float], int, int]:
         """

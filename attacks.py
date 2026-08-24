@@ -1,248 +1,299 @@
+from collections import OrderedDict
+
 import torch
 import models
+import torch.nn.functional as F
+from torch import optim
 
-import logging
+import hashlib
+import data
+import random
+import copy
+import config
+import client
+from client_types import ClientTypes
 
-log = logging.getLogger("attacks")
+# log = logging.getLogger("attacks")
 
 class Attack:
     def __init__(self, name):
         self.name = name
         self.prepared = False
 
-    def manipulate_update(self, update: torch.Tensor, global_layer: torch.Tensor, param_name: str|None=None) -> torch.Tensor:
+    def manipulate_update(self, update: torch.Tensor, global_layer: torch.Tensor, param_name: str|None=None, round_id: int|None=None) -> torch.Tensor:
         return update
     
-    def prepare(self, ref_state_dict: models.StateDict, model: type[torch.nn.Module]) -> None:
+    def prepare(self, ref_state_dict: models.StateDict, model: type[torch.nn.Module], dataset, split) -> None:
         self.prepared = True
-        pass
 
+    def apply(self, x: torch.Tensor, y: torch.Tensor, modify_y: bool=False) -> tuple[torch.Tensor, torch.Tensor]:
+        return x, y
 
-# class ByzantineFlip(Attack):
-#     def manipulate_update(self, update, param_name=None, **kwargs):
-#         return -update
+class ALIEAttack(Attack):
+    global_model_state: None|models.StateDict = None
+    def __init__(self, name):
+        self.name = name
+        self.prepared = False
 
-
-# class ScalingAttack(Attack):
-#     def __init__(self, name, factor=10):
-#         super().__init__(name)
-#         self.factor = factor
-
-#     def manipulate_update(self, update, param_name=None, **kwargs):
-#         return update * self.factor
+    def manipulate_update(self, update: torch.Tensor, global_layer: torch.Tensor, param_name: str|None=None, round_id: int|None=None) -> torch.Tensor:
+        return update
     
+    def prepare(self, ref_state_dict: models.StateDict, model: type[torch.nn.Module], dataset, split) -> None:
+        self.prepared = True
 
-# class NoiseInjectionAttack(Attack):
-#     def __init__(self, name, sigma=0.05):
-#         super().__init__(name)
-#         self.sigma = sigma
+    def apply(self, x: torch.Tensor, y: torch.Tensor, modify_y: bool=False) -> tuple[torch.Tensor, torch.Tensor]:
+        return x, y
 
-#     def manipulate_update(self, update, param_name=None, **kwargs):
-#         noise = torch.randn_like(update) * self.sigma
-#         return update + noise
+    @classmethod
+    def perform_alie_attack(
+            cls,
+            clients: list[client.Client],
+            z: float = 0.1
+        ):
+        """
+        Perform the ALIE (A Little Is Enough) attack on clients marked with client_type == ALIE.
+
+        Args:
+            clients: List of Client objects. Each client has attributes:
+                    - cid: int
+                    - model_state: OrderedDict (state dict of the model after local training)
+                    - client_type: ClientTypes
+            global_model_state: OrderedDict, the global model state before aggregation.
+            z: The scaling factor for the standard deviation in the attack (default: 0.1).
+        """
+
+        assert cls.global_model_state is not None, "Global model in ALIE attack is None"
+
+        # Separate benign clients (non-ALIE) and malicious clients (ALIE)
+        benign_clients = [c for c in clients if c.client_type != ClientTypes.ALIE]
+        malicious_clients = [c for c in clients if c.client_type == ClientTypes.ALIE]
+
+        if not benign_clients or not malicious_clients:
+            # No benign clients to compute statistics, or no malicious clients to attack
+            return
+
+        # Compute the parameter-wise updates for benign clients
+        # updates_list = [client.model_state - global_model_state] for each benign client
+        benign_updates = []
+        for client in benign_clients:
+            update = OrderedDict()
+            for key in cls.global_model_state.keys():
+                # Ensure both are on the same device (move to CPU for simplicity)
+                global_param = cls.global_model_state[key]#.cpu()
+                client_param = client.model_state[key]#.cpu()
+                update[key] = client_param - global_param
+            benign_updates.append(update)
+
+        # Compute mean and standard deviation per parameter across benign updates
+        # Initialize mean_dict and std_dict as zero tensors
+        mean_dict = OrderedDict()
+        std_dict = OrderedDict()
+        for key in cls.global_model_state.keys():
+            # Stack all benign updates for this parameter (shape: [num_benign, *param_shape])
+            stacked = torch.stack([upd[key] for upd in benign_updates], dim=0)
+            mean_dict[key] = stacked.mean(dim=0)
+            std_dict[key] = stacked.std(dim=0, unbiased=False)  # population std
+
+        # For each malicious client, compute the poisoned update: mean - z * std
+        for mal_client in malicious_clients:
+            poisoned_update = OrderedDict()
+            for key in cls.global_model_state.keys():
+                # Compute malicious update for this parameter
+                mal_update = mean_dict[key] - z * std_dict[key]
+                # The client's new model state = global_model + malicious_update
+                # Move to the same device as the original model_state if needed
+                device = mal_client.model_state[key].device
+                poisoned_update[key] = (cls.global_model_state[key] + mal_update).to(device)
+
+            # Replace the client's model_state with the poisoned one
+            mal_client.model_state = poisoned_update
+
+class SubtleAttack(Attack):
+    layer_names_affected = []
+    direction: dict[str, torch.Tensor] = {}  # will be filled in prepare()
+
+    def __init__(self, name: str, sample: float = 1.0):
+        super().__init__(name)
+        # self.epsilon = epsilon
+        self.global_sd = {}
+        self.shared_seed = None      # will be set in prepare
+        self.sample = sample       # used only during prepare (read‑only later)
+        self.copy_layer_names_affected = []
+
+    def prepare(self, ref_state_dict: models.StateDict, model: type[torch.nn.Module], dataset, split):
+        """
+        Called once per malicious client before any training.
+        We use a fixed seed derived from the attack name (or a pre-shared value)
+        so that all colluding clients generate the same sign pattern.
+        """
+        super().prepare(ref_state_dict, model, dataset, split)
+        # Generate a shared, deterministic seed from the attack name.
+        # In practice this could be a pre‑agreed integer.
+        seed_int = int(hashlib.md5(self.name.encode()).hexdigest()[:8], 16)
+        self.shared_seed = seed_int
+
+        if len(SubtleAttack.layer_names_affected) == 0 and self.sample != 1.0:
+            # random.choices(list(ref_state_dict.keys()))
+            layers = list(ref_state_dict.keys())
+            SubtleAttack.layer_names_affected = random.sample(layers, int(self.sample * len(layers)))
+
+        if len(SubtleAttack.direction) == 0:
+            m = model()
+            opt = optim.SGD(m.parameters(), lr=config.LR)
+            m.train()
+            
+            # x: torch.Tensor
+            # y: torch.Tensor
+        
+            old_sd = m.cpu().state_dict()
+            m.to(config.DEVICE)
+
+            train_loader = data.build_client_loaders(dataset, split, config.BATCH_SIZE, True)
+            for _ in range(config.LOCAL_EPOCHS):
+                for x, y in train_loader:
+                    x, y = x.to(config.DEVICE), y.to(config.DEVICE)
+        
+                    opt.zero_grad()
+                    loss = F.cross_entropy(m(x), y)
+                    loss.backward()
+                    opt.step()
+            
+            new_sd = m.cpu().state_dict()
+
+            for name, new_tensor in new_sd.items():
+
+                if self.sample != 1.0 and name not in SubtleAttack.layer_names_affected:
+                    continue
+
+                SubtleAttack.direction[name] = -15 * 2 * (new_tensor - old_sd[name])
+
+        if self.sample != 1.0:
+            self.copy_layer_names_affected = copy.deepcopy(SubtleAttack.layer_names_affected)
+
+        self.copy_direction = copy.deepcopy(SubtleAttack.direction)
+        # print(self.copy_direction)
+
+    def manipulate_update(self,
+                          update: torch.Tensor,
+                          global_layer: torch.Tensor,
+                          param_name: str|None = None,
+                          round_id: int|None=None) -> torch.Tensor:
+        """
+        Apply the subtle perturbation.
+        """
+        if not self.prepared :
+            raise Exception()
+
+        if param_name is None:
+            raise ValueError("param_name must be provided for coordinated sign computation")
+        
+        if self.sample != 1.0 and param_name not in self.copy_layer_names_affected:
+            return update
+        
+        # print(f"ATTACK DEBUG: {param_name=}")
+        # raise Exception(f"{param_name=}")
+
+        # Deterministic sign shared by all malicious clients for this layer.
+        # manipulated_update = update + self.copy_direction[param_name] * self.epsilon
+
+        manipulated_update = self.copy_direction[param_name]# * 25 * update.norm()
+        
+        # dist = update.norm()
+        # T_norm = 0.5
+        # manipulated_update_size = (1 - ((5*T_norm)/(3*dist)))
+        # manipulated_update = manipulated_update_size * update
+        
+        # if round_id == 1:
+        # manipulated_update = -update
+
+        # manipulated_update = torch.zeros_like(update)
+        
+
+        # eps = 1e-8
+        # # manipulated_update_scaled = manipulated_update * (update.norm(p=2) / manipulated_update.norm(p=2) + eps)
+
+        # # value = 1
+        # final_value = update.norm(p=2)
+        # final_value = final_value + 0.5*final_value
+
+        # round_id = 10 if round_id is None else round_id
+        # value = max(((round_id-1)*(final_value - 1))/(5) + 1, final_value)
+
+        # print(dist, manipulated_update.norm(), manipulated_update_size, manipulated_update.size())
+
+        # manipulated_update_scaled = manipulated_update * (value / manipulated_update.norm(p=2) + eps)
+
+        return manipulated_update
     
+#####################################################
 
-# class RandomSignAttack(Attack):
-#     def manipulate_update(self, update, param_name=None, **kwargs):
-#         signs = torch.randint_like(update, low=0, high=2).float()
-#         signs = signs * 2 - 1
-#         return update * signs
-    
+class BackdoorAttack(Attack):
+    def __init__(self, name: str, trigger_size: int = 3, poison_fraction: float = 0.3, target_class: int = 0):
+        super().__init__(name)
+        self.trigger_size = trigger_size
+        self.poison_fraction = poison_fraction
+        self.target_class = target_class
+        self.trigger_pattern: None|torch.Tensor = None   # will be created in prepare()
 
-# class NormBoundAttack(Attack):
-#     def __init__(self, name, max_norm=5):
-#         super().__init__(name)
-#         self.max_norm = max_norm
+    def prepare(self, ref_state_dict: models.StateDict, model: type[torch.nn.Module], dataset, split) -> None:
+        """Pre-compute the trigger pattern (a white square) once."""
+        # Assuming images are in [0,1] range. For [0,255] use 255.0 instead of 1.0.
+        self.trigger_pattern = torch.full((3, self.trigger_size, self.trigger_size), 1.0)
+        self.prepared = True
 
-#     def manipulate_update(self, update, param_name=None, **kwargs):
-#         norm = torch.linalg.vector_norm(update)
+    def apply(self, x: torch.Tensor, y: torch.Tensor, modify_y: bool=False) -> tuple[torch.Tensor, torch.Tensor]:
+        """Add trigger to a random subset of the batch and set their labels to target_class."""
 
-#         if norm == 0:
-#             return update
+        if not self.prepared or not isinstance(self.trigger_pattern, torch.Tensor):
+            raise Exception()
 
-#         return update / norm * self.max_norm
-    
-# class MeanShiftAttack(Attack):
-#     def __init__(self, name, shift=3):
-#         super().__init__(name)
-#         self.shift = shift
+        batch_size = x.size(0)
+        # Decide which samples to poison
+        poison_mask = torch.rand(batch_size) < 0.3 #self.poison_fraction
 
-#     def manipulate_update(self, update, param_name=None, **kwargs):
-#         return update + self.shift
+        if poison_mask.any():
+            # Add the trigger pattern to the bottom‑right corner of poisoned images
+            x_poisoned = x[poison_mask]
+            # Ensure trigger pattern is on the same device and broadcastable
+            trigger = self.trigger_pattern.to(x.device)
+            # Place trigger at bottom‑right corner
+            x_poisoned[:, :, -self.trigger_size:, -self.trigger_size:] = trigger
+            x[poison_mask] = x_poisoned
 
-# class LayerBackdoorAttack(Attack):
-#     def __init__(self, name, target_layer, strength=5):
-#         super().__init__(name)
-#         self.target_layer = target_layer
-#         self.strength = strength
+            if modify_y:
+                y[poison_mask] = self.target_class
 
-#     def manipulate_update(self, update, param_name: str|None=None, **kwargs):
-
-#         if param_name and self.target_layer in param_name:
-#             return update + torch.ones_like(update) * self.strength
-
-#         return update
-    
+        return x, y
 
 
-# class LayerBackdoorAttack2(Attack):
-#     def __init__(self, name: str, target_layer: str, strength: float = 2.0, stealth: float = 0.2):
-#         super().__init__(name)
-#         self.target_layer = target_layer
-#         self.strength = strength
-#         self.stealth = stealth
-#         self._trigger_direction: dict[str, torch.Tensor] = {}  # will be filled in prepare()
+class LabelSwitchAttack(Attack):
+    label_switch = {}
 
-#     def prepare(self, ref_state_dict: models.StateDict) -> None:
-#         super().prepare(ref_state_dict)
+    def __init__(self, name: str, total_labels: int):
+        super().__init__(name)
+        self.total_labels = total_labels
 
-#         for name, ref_tensor in ref_state_dict.items():
-#             if self.target_layer in name:
-#                 direction = torch.randn_like(ref_tensor)
-#                 norm = torch.linalg.vector_norm(direction)
-#                 if norm > 0:
-#                     direction = direction / norm
-#                 self._trigger_direction[name] = direction
+    def prepare(self, ref_state_dict: models.StateDict, model: type[torch.nn.Module], dataset, split) -> None:
+        """Pre-compute the trigger pattern (a white square) once."""
+        # Assuming images are in [0,1] range. For [0,255] use 255.0 instead of 1.0.
+        labels = list(range(self.total_labels))
+        if len(LabelSwitchAttack.label_switch) == 0:
+            for label, rnd_label in zip(labels, random.sample(labels, k=len(labels))):
+                LabelSwitchAttack.label_switch[label] = rnd_label
+        self.prepared = True
 
-#     def manipulate_update(self, update: torch.Tensor, param_name: str|None = None, **kwargs) -> torch.Tensor:
+    def apply(self, x: torch.Tensor, y: torch.Tensor, modify_y: bool=False) -> tuple[torch.Tensor, torch.Tensor]:
+        """Add trigger to a random subset of the batch and set their labels to target_class."""
 
-#         assert self.prepared, f"'{self.name}' ATTACK HASN'T BEEN PREPARED"
+        if not self.prepared:
+            raise Exception()
 
-#         if param_name is None or param_name not in self._trigger_direction:
-#             return update
+        # x = torch.tensor([1, 2, 5, 3])
 
-#         trigger = self._trigger_direction[param_name]
-#         poisoned = update + self.strength * trigger
+        lut = torch.arange(self.total_labels)
+        for old, new in LabelSwitchAttack.label_switch.items():
+            lut[old] = new
 
-#         # Preserve the original norm
-#         orig_norm = torch.linalg.vector_norm(update)
-#         new_norm = torch.linalg.vector_norm(poisoned)
-#         if new_norm > 0:
-#             poisoned = poisoned * (orig_norm / new_norm)
+        y = lut[y]
 
-#         # Add stealth noise (scaled by the standard deviation of the honest update)
-#         std = torch.std(update) if update.numel() > 1 else 0.0
-#         if std > 0:
-#             stealth_noise = torch.randn_like(update) * self.stealth * std
-#         else:
-#             stealth_noise = torch.zeros_like(update)
-#         return poisoned + stealth_noise    
-
-
-# class CoordinatedKrumAttack(Attack):
-#     def __init__(self, name: str, strength: float = 3.0, seed: int = 42):
-#         super().__init__(name)
-#         self.strength = strength
-#         self.seed = seed
-#         self._direction: dict[str, torch.Tensor] = {}  # will be filled in prepare()
-
-#     def prepare(self, ref_state_dict: models.StateDict) -> None:
-#         super().prepare(ref_state_dict)
-
-#         for name, ref_tensor in ref_state_dict.items():
-#             generator = torch.Generator(device=ref_tensor.device)
-
-#             # Combine seed with parameter name hash to get per‑parameter deterministic direction
-#             generator.manual_seed(self.seed + hash(name) % 2**32)
-#             direction = torch.randn_like(ref_tensor, generator=generator)
-#             norm = torch.linalg.vector_norm(direction)
-
-#             if norm > 0:
-#                 direction = direction / norm
-#             self._direction[name] = direction
-
-#     def manipulate_update(self, update: torch.Tensor, param_name: str|None = None, **kwargs) -> torch.Tensor:
-
-#         assert self.prepared, f"'{self.name}' ATTACK HASN'T BEEN PREPARED"
-
-#         if param_name is None or param_name not in self._direction:
-#             return update
-#         direction = self._direction[param_name]
-#         return update + self.strength * direction
-    
-
-# class SybilAttack(Attack):
-#     def __init__(self, name: str, strength: float = 4.0):
-#         super().__init__(name)
-#         self.strength = strength
-#         self._direction: dict[str, torch.Tensor] = {}
-
-#     def prepare(self, ref_state_dict: models.StateDict) -> None:
-#         super().prepare(ref_state_dict)
-
-#         for name, ref_tensor in ref_state_dict.items():
-#             direction = torch.randn_like(ref_tensor)
-#             norm = torch.linalg.vector_norm(direction)
-#             if norm > 0:
-#                 direction = direction / norm
-#             self._direction[name] = direction
-
-#     def manipulate_update(self, update: torch.Tensor, param_name: str|None = None, **kwargs) -> torch.Tensor:
-
-#         assert self.prepared, f"'{self.name}' ATTACK HASN'T BEEN PREPARED"
-
-#         if param_name is None or param_name not in self._direction:
-#             return update
-#         direction = self._direction[param_name]
-#         return update + self.strength * direction
-    
-
-# class SybilAttack2(Attack):
-#     def __init__(self, name: str, correlation: float = 0.9, strength: float = 3.0, client_id: int = 0):
-#         super().__init__(name)
-#         self.correlation = correlation
-#         self.strength = strength
-#         self.client_id = client_id
-#         self._base_direction: dict[str, torch.Tensor] = {}   # common base (shared across clients)
-#         self._client_direction: dict[str, torch.Tensor] = {} # per‑client direction
-
-#     def prepare(self, ref_state_dict: models.StateDict) -> None:
-#         super().prepare(ref_state_dict)
-
-#         for name, ref_tensor in ref_state_dict.items():
-#             # Common base direction (deterministic across all clients)
-#             base_gen = torch.Generator(device=ref_tensor.device)
-#             base_gen.manual_seed(999 + hash(name) % 2**32)  # fixed seed for base
-#             base = torch.randn_like(ref_tensor, generator=base_gen)
-#             norm_base = torch.linalg.vector_norm(base)
-#             if norm_base > 0:
-#                 base = base / norm_base
-#             self._base_direction[name] = base
-
-#             # Per‑client direction
-#             client_gen = torch.Generator(device=ref_tensor.device)
-#             client_gen.manual_seed(self.client_id + hash(name) % 2**32)
-#             rand = torch.randn_like(ref_tensor, generator=client_gen)
-#             norm_rand = torch.linalg.vector_norm(rand)
-#             if norm_rand > 0:
-#                 rand = rand / norm_rand
-#             self._client_direction[name] = rand
-
-#     def manipulate_update(self, update: torch.Tensor, param_name: str|None = None, **kwargs) -> torch.Tensor:
-
-#         assert self.prepared, f"'{self.name}' ATTACK HASN'T BEEN PREPARED"
-
-#         if param_name is None or param_name not in self._base_direction:
-#             return update
-
-#         base = self._base_direction[param_name]
-#         rand = self._client_direction[param_name]
-
-#         # Combine base and random
-#         direction = self.correlation * base + (1 - self.correlation) * rand
-#         norm_dir = torch.linalg.vector_norm(direction)
-#         if norm_dir > 0:
-#             direction = direction / norm_dir
-
-#         # Apply malicious shift and preserve original norm
-#         poisoned = update + self.strength * direction
-#         orig_norm = torch.linalg.vector_norm(update)
-#         new_norm = torch.linalg.vector_norm(poisoned)
-#         if new_norm > 0:
-#             poisoned = poisoned * (orig_norm / new_norm)
-
-#         return poisoned
-    
-
-# attacks_to_prepare: list[type[Attack]] = [LayerBackdoorAttack2, CoordinatedKrumAttack, SybilAttack, SybilAttack2]
-attacks_to_prepare: list[type[Attack]] = []
+        return x, y

@@ -1,6 +1,8 @@
 import logging as log
 import pickle
 import types as typ
+from enum import Enum
+import types
 
 import os
 import ray
@@ -12,18 +14,22 @@ import data_pathalogical as datap
 import data2
 import models
 from client import Client
-from server import Server
+from server import Server, TrainProtocol
 
-from dataset_analysis import analyze_feature_similarity
+# from dataset_analysis import analyze_feature_similarity
 from collections import Counter
 
-def default(log_file: str|None = None):
+class DataDistribution(Enum):
+    Pathological = 1
+    Dirchlet = 2
+
+def default(log_file: str|None = None, data_distribution_module: types.ModuleType = datap):
     if log_file is not None: os.makedirs(config.LOG_DIR, exist_ok=True)
     lib.set_all_seeds(config.RANDOM_SEED)
     lib.set_log_level(log.INFO, log_file)
 
     # train_loaders, test_loaders = data.generate_federated_dataloaders(config.NUM_CLIENTS, config.DIRICHLET_ALPHA, config.BATCH_SIZE, train_test_split_ratio=0.8)
-    client_splits, combined_data, full_features = datap.generate_client_splits(
+    client_splits, combined_data, full_features = data_distribution_module.generate_client_splits(
         config.NUM_CLIENTS, 
         config.DIRICHLET_ALPHA, 
         train_test_split_ratio=0.8,
@@ -35,12 +41,18 @@ def default(log_file: str|None = None):
     return client_splits, combined_data, full_features
 
 
-def main(run_name, test_run_calc: bool=False):
+def main(train_protocol: TrainProtocol, run_name: str, test_run_calc: bool=False, data_distribution: DataDistribution = DataDistribution.Pathological):
+
+    module__ = datap
+    if data_distribution == DataDistribution.Pathological:
+        module__ = datap
+    elif data_distribution == DataDistribution.Dirchlet:
+        module__ = data2
 
     if not test_run_calc: ray.init(num_cpus=config.NUM_CPUS, num_gpus=config.NUM_GPUS)
     run_id, run_log_dir = lib.generate_new_log_run(run_name, (not test_run_calc))
 
-    client_splits, combined_data, full_features = default(run_log_dir if not test_run_calc else None)
+    client_splits, combined_data, full_features = default(run_log_dir if not test_run_calc else None, module__)
 
     # if full_features is not None: 
     #     client_train_indices = [train_idx for train_idx, _ in client_splits]
@@ -56,7 +68,7 @@ def main(run_name, test_run_calc: bool=False):
     server = Server(model, types, client_splits, config.NUM_CLIENTS, config.RANDOM_SEED)
 
     log.info("Starting Training", extra={"save": True})
-    save_folder = server.train(combined_data, run_id, run_log_dir, save=True, test_run_calc=test_run_calc)
+    save_folder = server.train(train_protocol, combined_data, run_id, run_log_dir, save=True, test_run_calc=test_run_calc)
 
     if config.WRITE_LOGS and not test_run_calc:
         with open(f"{save_folder}/metadata.npy", "wb") as f:
@@ -369,7 +381,12 @@ if __name__ == "__main__":
     # folder_to_test = "RUN_Sat_Jul_25_18-36-25_2026_backdoor_avg"
 
 
-    main("normal_fedattract_pathalogical_dropout50", test_run_calc=False)
+    main(
+        TrainProtocol.FedAttract, 
+        "normal_fedattract_pathalogical_dropout50", 
+        test_run_calc=False,
+        data_distribution=DataDistribution.Pathological
+    )
     # test_backdoor(folder_to_test)
     # blind_test_backdoor(folder_to_test)
     # blind_test_backdoor_topology(foslder_to_test)
