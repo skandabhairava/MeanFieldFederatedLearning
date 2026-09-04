@@ -1,3 +1,4 @@
+topology.py
 import torch
 import logging as log
 import copy
@@ -9,19 +10,17 @@ import stats
 from sklearn.cluster._hdbscan.hdbscan import HDBSCAN
 # from sklearn.metrics import pairwise_distances
 from sklearn.metrics import pairwise_distances_argmin_min
-import torch.nn.functional as F
 from uuid import uuid4
 import math
 
 from collections import OrderedDict
-import config
 
 class Cluster:
     def __init__(
             self,
             members: dict[int, 'client.Client|Cluster'],
             dist_func: Callable[[torch.Tensor, torch.Tensor], float],
-            project_func: Callable[[torch.Tensor, torch.Tensor|None, bool, bool], torch.Tensor],
+            project_func: Callable[[torch.Tensor], torch.Tensor],
             parent: 'Cluster|None' = None,
             cluster_center: models.StateDict|None = None,
         ) -> None:
@@ -37,55 +36,14 @@ class Cluster:
             self.model_state = Cluster.avg_model_states([(child.cid, child.model_state) for child in members.values()])
         else:
             self.model_state = cluster_center
-        self.model_state_flattened = self.project_func(
-            stats.flatten(self.model_state),
-            None,
-            False,
-            False
-        )
+        self.model_state_flattened = self.project_func(stats.flatten(self.model_state))
 
         # distances and total_dist will be recomputed during updates
         self.dists, self.total_dist = self.calc_distances({cid: (c.model_state, c.model_state_flattened) for cid, c in self.members.items()}) #dict[int, tuple[models.StateDict, torch.Tensor]]
         self.has_split = False
 
-    @staticmethod
-    def hdbscan_features(
-        proj: torch.Tensor,
-        proj_dim: int,
-        lambda_: float = 1.0,
-        eps: float = 1e-8,
-    ) -> torch.Tensor:
-        """
-        proj: (4*proj_dim,)
-            [pos | diff1 | diff2 | diff3]
-
-        returns:
-            [scaled_pos | lambda * normalized_history]
-        """
-
-        if not config.USE_VELOCITY:
-            return proj
-
-        pos = proj[:proj_dim]
-        history = proj[proj_dim:]
-
-        # Standardize each position dimension
-        pos_mean = pos.mean(dim=0, keepdim=True)
-        pos_std = pos.std(dim=0, keepdim=True).clamp_min(eps)
-        pos = (pos - pos_mean) / pos_std
-
-        # Normalize the ENTIRE history vector
-        history = F.normalize(history, p=2, dim=0, eps=eps)
-
-        return torch.cat(
-            [
-                pos,
-                lambda_ * history,
-            ]
-        )
-
     def calc_distances(
-            self, 
+            self,
             member_states: dict[int, tuple[models.StateDict, torch.Tensor]]
         ) -> tuple[dict[int, float], float]:
         """
@@ -95,14 +53,12 @@ class Cluster:
         dists = {}
         total_dist = 0.0
         for ident, state__flat in member_states.items():
-            m_state_flat = Cluster.hdbscan_features(self.model_state_flattened, 5)
-            c_state_flat = Cluster.hdbscan_features(state__flat[1], 5)
-            d = self.dist_func(c_state_flat, m_state_flat)
+            d = self.dist_func(state__flat[1], self.model_state_flattened)
             dists[ident] = d
             total_dist += d
         return dists, total_dist
 
-    def update_centers_upward(self, updated_client_states: dict[int, models.StateDict], use_softmax=False) -> int:
+    def update_centers_upward(self, updated_client_states: dict[int, models.StateDict]) -> int:
         """
         Recursively update cluster centers from leaves upward.
         updated_client_states: dict mapping client.cid -> new state_dict (after local training).
@@ -112,11 +68,11 @@ class Cluster:
         # First, update child clusters (if any) and collect their current states
         member_states: dict[int, tuple[models.StateDict, torch.Tensor]] = {}
         for cid, m in self.members.items():
-            if isinstance(m, client.Client):                
+            if isinstance(m, client.Client):
                 member_states[m.cid] = (m.model_state, m.model_state_flattened)
             else:
                 # Recursively update child cluster
-                bigo_t += m.update_centers_upward(updated_client_states, use_softmax=use_softmax)
+                bigo_t += m.update_centers_upward(updated_client_states)
                 # After child cluster updated, its center is new
                 member_states[m.cid] = m.model_state, m.model_state_flattened
 
@@ -124,27 +80,10 @@ class Cluster:
         bigo_t += len(member_states)
         self.dists, self.total_dist = self.calc_distances(member_states)
 
-        if use_softmax:
-            self.model_state = Cluster.attract_aggregate_softmax(
-                member_states, self.dists, self.model_state, self.total_dist
-            )
-            self.model_state_flattened = self.project_func(
-                stats.flatten(self.model_state),
-                self.model_state_flattened,
-                True,
-                False
-            )
-            return bigo_t
-
         self.model_state = Cluster.attract_aggregate(
             member_states, self.dists, self.model_state, self.total_dist
         )
-        self.model_state_flattened = self.project_func(
-            stats.flatten(self.model_state),
-            self.model_state_flattened,
-            True,
-            False
-        )
+        self.model_state_flattened = self.project_func(stats.flatten(self.model_state))
         return bigo_t
 
     def propagate_downward(self) -> int:
@@ -166,12 +105,7 @@ class Cluster:
                     # m.model_state[key] = (self.model_state[key] * (1 - dist_w)) + (m.model_state[key] * dist_w)
                     m.model_state[key].mul_(dist_w).add_(self.model_state[key], alpha=one_minus_dist)
 
-                m.model_state_flattened = self.project_func(
-                    stats.flatten(m.model_state),
-                    m.model_state_flattened,
-                    False,
-                    True
-                )
+                m.model_state_flattened = self.project_func(stats.flatten(m.model_state))
             else:
                 # For a child cluster: update its center and then propagate further down
                 # Use same formula: child center = (parent_center*(1-dist_w)) + (child_center*dist_w)
@@ -179,12 +113,7 @@ class Cluster:
                     # m.model_state[key] = (self.model_state[key] * (1 - dist_w)) + (m.model_state[key] * dist_w)
                     m.model_state[key].mul_(dist_w).add_(self.model_state[key], alpha=one_minus_dist)
 
-                m.model_state_flattened = self.project_func(
-                    stats.flatten(m.model_state),
-                    m.model_state_flattened,
-                    False,
-                    True
-                )
+                m.model_state_flattened = self.project_func(stats.flatten(m.model_state))
                 # Also update child's distances? Not needed; child will recompute when propagate_downward called on it.
                 bigo_s += m.propagate_downward()
 
@@ -236,51 +165,15 @@ class Cluster:
 
         return global_weights
 
-    @staticmethod
-    def attract_aggregate_softmax(
-        client_weights: dict[int, tuple[models.StateDict, torch.Tensor]],  # (state, ident, distance)
-        dists: dict[int, float],
-        cluster_center: models.StateDict,
-        _total_client_dist: float
-    ) -> models.StateDict:
-        """Weighted aggregation where weight = 1 - (dist/total_dist)."""
-        if not client_weights:
-            return copy.deepcopy(cluster_center)
-
-        T = 8.0 # temperature
-        max_score = max(-d / T for d in dists.values())
-        exp_scores = {ident: math.exp((-d/T) - max_score) for ident, d in dists.items()}
-        sum_exp = sum(exp_scores.values())
-        weights = {ident: exp / sum_exp for ident, exp in exp_scores.items()}
-
-        global_weights = copy.deepcopy(cluster_center)
-        for key in global_weights.keys():
-            total = 0.0
-            assign = True
-
-            for ident, (state, _flat) in client_weights.items():
-                w = weights[ident]
-                if assign:
-                    global_weights[key] = state[key] * w
-                    assign = False
-                else:
-                    global_weights[key] += state[key] * w
-
-                total += w
-
-            global_weights[key] /= total
-
-        return global_weights
-
-    def split(self) -> int:
+    def split(self, assign_noise_to_nearest_cluster: bool=True) -> int:
         bigo_t = 0
         if self.has_split:
             for m in self.members.values():
                 if isinstance(m, Cluster):
-                    bigo_t += m.split()
+                    bigo_t += m.split(assign_noise_to_nearest_cluster)
 
             return bigo_t
-        
+
         if len(self.members) == 2:
             log.info(f"Cluster '{self.cid}' has reached min_cluster_size")
             return bigo_t
@@ -293,7 +186,7 @@ class Cluster:
             member_cid.append(cid)
             members.append(mem)
 
-        X = np.array([Cluster.hdbscan_features(m.model_state_flattened, 5).numpy().astype(np.float64) for m in members])
+        X = np.array([m.model_state_flattened.numpy().astype(np.float64) for m in members])
 
         label_members: dict[int, list[int]] = {}
 
@@ -321,7 +214,7 @@ class Cluster:
                 if len(unique_clusters) > 1:
                     # Assign each noise point to nearest cluster center
                     centers = np.array([X[labels_all == c].mean(axis=0) for c in unique_clusters])
-                    
+
                     nearest, _ = pairwise_distances_argmin_min(X[noise_idx], centers)
                     bigo_t += len(X[noise_idx])*len(centers)
 
@@ -367,9 +260,9 @@ class Cluster:
 
     def _build_cluster_metadata_tree(self) -> dict[str, int|str|dict]:
         tree = {
-            'cid': self.cid, 
-            'type': "Cluster", 
-            'model_state': self.model_state, 
+            'cid': self.cid,
+            'type': "Cluster",
+            'model_state': self.model_state,
             'members': {cid: member._build_cluster_metadata_tree() for cid, member in self.members.items()}
         }
         return tree
@@ -378,7 +271,7 @@ class Cluster:
     def avg_model_states(client_weights: Sequence[tuple[int, models.StateDict]]) -> models.StateDict:
         if not client_weights:
             return {} # pyright: ignore[reportReturnType]
-        
+
         global_weights = copy.deepcopy(client_weights[0][1]) # Copy 1st state dict
         for key in global_weights:
             global_weights[key] = client_weights[0][1][key].clone()
@@ -387,3 +280,63 @@ class Cluster:
 
             global_weights[key] /= len(client_weights)
         return global_weights
+
+server.py
+...
+def single_round_fed_attract(
+    self,
+    round_id,
+    run_id,
+    dataset_ref: Dataset,
+    batch_size,
+    device,
+    test_run_calc:bool=False
+    ) -> tuple[tuple[float, float, float], list[float], int, int]:
+    bigo_t = 0
+    bigo_s = 0
+    if not test_run_calc:
+        m = int(len(self.clients) * config.CLIENT_FRAC)
+        selected = random.sample(self.clients, m)
+
+        train_start = time.time()
+        futures = [c.train(dataset_ref, batch_size, device, round_id) for c in selected]
+        local_sds__cid = ray.get(futures)
+
+        for sd, cid in local_sds__cid:
+            self.clients[cid].model_state = sd[0]
+            self.clients[cid].model_state_flattened = self.project(stats.flatten(sd[0]))
+        # log.info(f"\t\tTime taken to copy updates: {time.time() - start}")
+
+        train_end = time.time()
+
+        updated_states = {cid: sd[0] for sd, cid in local_sds__cid}
+    else:
+        updated_states = {c.cid: c.model_state for c in self.clients}
+
+    alg_start = time.time()
+    if round_id % config.ATTRACT_SPLIT_EVERY == 0:
+        bigo_t += self.global_cluster.split()
+
+    bigo_t += self.global_cluster.update_centers_upward(updated_states)
+    bigo_s += self.global_cluster.propagate_downward()
+    alg_end = time.time()
+
+    if not test_run_calc:
+        log.info("Finished training. Starting Eval")
+        acc_start = time.time()
+        accs = ray.get([c.evaluate(dataset_ref, batch_size, device) for c in self.clients if c.client_type == client.ClientTypes.NORMAL]) # list[tuple[float, client_id#int]]
+        acc_end = time.time()
+
+        accs.sort(key=lambda x: x[1])
+        # accs_, _, counters = zip(*accs)
+        accs_, _, counters = zip(*accs)
+
+        if counters[0] is not None:
+            final_counter = reduce(lambda x, y: x+y, counters)
+            log.info(final_counter)
+
+        accs_lis = list(accs_)
+
+    if test_run_calc:
+        return (0, alg_end-alg_start, 0), [], bigo_t, bigo_s
+    return (train_end-train_start, alg_end-alg_start, acc_end-acc_start), accs_lis, bigo_t, bigo_s

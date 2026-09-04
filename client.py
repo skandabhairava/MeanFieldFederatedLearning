@@ -39,7 +39,8 @@ class Client:
         self.model_state_flattened = proj_func(stats.flatten(self.model_state))
         self.save_path = f"{self.cid}_model.pth"
 
-        self.attack = None
+        self.attack: attacks.Attack|None = None
+        self.atack_type = client_type
 
         if client_type == ClientTypes.SUBTLE:
             self.attack = attacks.SubtleAttack("subtle")
@@ -50,7 +51,7 @@ class Client:
         elif client_type == ClientTypes.LABEL_SWITCH:
             self.attack = attacks.LabelSwitchAttack("label_switch", 10)
         elif client_type == ClientTypes.ALIE:
-            self.attack = attacks.ALIEAttack("label_switch")
+            self.attack = attacks.ALIEAttack("alie")
 
         if save_log:
             log.info(f"Client {self.cid} has been assigned type: {client_type}", extra={"save": True})

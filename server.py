@@ -1,3 +1,4 @@
+from collections import Counter
 import time
 import random
 import logging as log
@@ -17,6 +18,7 @@ import data
 import topology
 import comparision_algorithms
 from client_types import ClientTypes
+from attacks import ALIEAttack
 
 import copy
 import math
@@ -59,6 +61,8 @@ class Server:
         ]
         self.clients.sort(key=lambda c: c.cid)
         log.debug("Created Clients")
+
+        self.client_types = Counter([c.atack_type for c in self.clients])
 
         self.global_cluster = topology.Cluster({c.cid: c for c in self.clients}, self.dist_func, self.project)
 
@@ -113,21 +117,51 @@ class Server:
         bigo_ts = []
         bigo_ss = []
 
-        ALIE_clients = [c for c in self.clients if c.attack == ClientTypes.ALIE]
+        ALIE_clients = [c for c in self.clients if c.atack_type == ClientTypes.ALIE]
 
         for round_id in range(1, config.ROUNDS+1):
             if len(ALIE_clients) != 0:
-                ALIE_clients[0].attack.global_model_state = topology.Cluster.avg_model_states([(c.cid, c.model_state) for c in ALIE_clients])  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
+                ALIEAttack.global_model_state = topology.Cluster.avg_model_states([(c.cid, c.model_state) for c in self.clients])  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
 
             log.info(f"{round_id}/{config.ROUNDS}: ", extra={"save": True})
             if train_protocol == TrainProtocol.FedAttract:
-                time_taken, client_accs, bigo_t, bigo_s = self.round_fed_attract(round_id, run_id, dataset_ref, batch_size, device, test_run_calc)
+                time_taken, client_accs, bigo_t, bigo_s = self.round_fed_attract(
+                    round_id, 
+                    run_id, 
+                    dataset_ref, 
+                    batch_size, 
+                    [ALIE_clients[0]],
+                    device, 
+                    test_run_calc
+                )
             elif train_protocol == TrainProtocol.FedAvg:
-                time_taken, client_accs, bigo_t, bigo_s = self.round_fed_avg(round_id, run_id, dataset_ref, batch_size, device)
+                time_taken, client_accs, bigo_t, bigo_s = self.round_fed_avg(
+                    round_id, 
+                    run_id, 
+                    dataset_ref, 
+                    batch_size, 
+                    [ALIE_clients[0]],
+                    device
+                )
             elif train_protocol == TrainProtocol.FedKrum:
-                time_taken, client_accs, bigo_t, bigo_s = self.round_fed_krum(round_id, run_id, dataset_ref, batch_size, device)
+                time_taken, client_accs, bigo_t, bigo_s = self.round_fed_krum(
+                    round_id, 
+                    run_id, 
+                    dataset_ref, 
+                    batch_size, 
+                    [ALIE_clients[0]],
+                    device,
+                )
             elif train_protocol == TrainProtocol.FedCap:
-                time_taken, client_accs, bigo_t, bigo_s = self.round_fed_cap(round_id, run_id, dataset_ref, batch_size, device, test_run_calc)
+                time_taken, client_accs, bigo_t, bigo_s = self.round_fed_cap(
+                    round_id, 
+                    run_id, 
+                    dataset_ref, 
+                    batch_size, 
+                    [ALIE_clients[0]],
+                    device, 
+                    test_run_calc
+                )
 
             if not test_run_calc:
                 log.info(f"Time taken to train: {time_taken[0]}s, accuracy: {time_taken[2]}", extra={"save": True})
@@ -142,8 +176,8 @@ class Server:
 
             self.global_cluster.print_tree()
 
-            if len(ALIE_clients) != 0:
-                ALIE_clients[0].attack.perform_alie_attack(self.clients)  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
+            # if len(ALIE_clients) != 0:
+            #     ALIEAttack.perform_general_post_update_attack(self.clients)  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
 
             if not test_run_calc:
                 if round_id % 10 == 0 and round_id != config.ROUNDS:
@@ -164,7 +198,16 @@ class Server:
 
         return log_save_dir
 
-    def round_fed_attract(self, round_id, run_id, dataset_ref: Dataset, batch_size, device, test_run_calc:bool=False) -> tuple[tuple[float, float, float], list[float], int, int]:
+    def round_fed_attract(
+            self, 
+            round_id, 
+            run_id, 
+            dataset_ref: Dataset, 
+            batch_size, 
+            post_update_attack_clients: list[client.Client],
+            device, 
+            test_run_calc:bool=False
+        ) -> tuple[tuple[float, float, float], list[float], int, int]:
         bigo_t = 0
         bigo_s = 0
         if not test_run_calc:
@@ -182,6 +225,15 @@ class Server:
                     old_proj=self.clients[cid].model_state_flattened,
                     shift_diffs=True
                 )
+
+            for attack_client in post_update_attack_clients:
+                if attack_client.attack is not None:
+                    attack_client.attack.perform_general_post_update_attack(
+                        self.clients,
+                        len(self.clients),
+                        self.client_types[attack_client.atack_type]
+                    )
+    
             # log.info(f"\t\tTime taken to copy updates: {time.time() - start}")
 
             train_end = time.time()
@@ -218,7 +270,15 @@ class Server:
             return (0, alg_end-alg_start, 0), [], bigo_t, bigo_s
         return (train_end-train_start, alg_end-alg_start, acc_end-acc_start), accs_lis, bigo_t, bigo_s # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
 
-    def round_fed_avg(self, round_id, run_id, dataset_ref: Dataset, batch_size, device) -> tuple[tuple[float, float, float], list[float], int, int]:
+    def round_fed_avg(
+            self, 
+            round_id, 
+            run_id, 
+            dataset_ref: Dataset, 
+            batch_size, 
+            post_update_attack_clients: list[client.Client],
+            device
+        ) -> tuple[tuple[float, float, float], list[float], int, int]:
         m = int(len(self.clients) * config.CLIENT_FRAC)
         selected = random.sample(self.clients, m)
 
@@ -227,10 +287,19 @@ class Server:
         local_sds__cid = ray.get(futures)
         train_end = time.time()
 
-        updated_states = [(cid, sd[0]) for sd, cid in local_sds__cid]
+        for (state, _), cid in local_sds__cid:
+            self.clients[cid].model_state = state
+
+        for attack_client in post_update_attack_clients:
+            if attack_client.attack is not None:
+                attack_client.attack.perform_general_post_update_attack(
+                    self.clients,
+                    len(self.clients),
+                    self.client_types[attack_client.atack_type]
+                )
 
         alg_start = time.time()
-        new_global = topology.Cluster.avg_model_states(updated_states)
+        new_global = topology.Cluster.avg_model_states([(c.cid, c.model_state) for c in self.clients])
         alg_end = time.time()
 
         # start = time.time()
@@ -253,7 +322,15 @@ class Server:
         return (train_end-train_start, alg_end-alg_start, acc_end-acc_start), accs_lis, m, 1
 
     # time_taken, client_accs, bigo_t, bigo_s    
-    def round_fed_krum(self, round_id, run_id, dataset_ref: Dataset, batch_size, device) -> tuple[tuple[float, float, float], list[float], int, int]:
+    def round_fed_krum(
+            self, 
+            round_id, 
+            run_id, 
+            dataset_ref: Dataset, 
+            batch_size,
+            post_update_attack_clients: list[client.Client],
+            device
+        ) -> tuple[tuple[float, float, float], list[float], int, int]:
         m = int(len(self.clients) * config.CLIENT_FRAC)
         selected = random.sample(self.clients, m)
 
@@ -262,12 +339,19 @@ class Server:
         local_sds__cid = ray.get(futures)
         train_end = time.time()
 
-        updated_states = [(cid, sd[0]) for sd, cid in local_sds__cid]
+        for (state, _), cid in local_sds__cid:
+            self.clients[cid].model_state = state
 
-        # new_global = topology.Cluster.avg_model_states(updated_states)
+        for attack_client in post_update_attack_clients:
+            if attack_client.attack is not None:
+                    attack_client.attack.perform_general_post_update_attack(
+                        self.clients,
+                        len(self.clients),
+                        self.client_types[attack_client.atack_type]
+                    )
 
         alg_start = time.time()
-        new_global = comparision_algorithms.krum_aggregate_adaptive(updated_states)
+        new_global = comparision_algorithms.krum_aggregate_adaptive([(c.cid, c.model_state) for c in self.clients])
         alg_end = time.time()
 
         # start = time.time()
@@ -289,7 +373,16 @@ class Server:
 
         return (train_end-train_start, alg_end-alg_start, acc_end-acc_start), accs_lis, m, 1
     
-    def round_fed_cap(self, round_id, run_id, dataset_ref, batch_size, device, test_run_calc:bool=False) -> tuple[tuple[float, float, float], list[float], int, int]:
+    def round_fed_cap(
+            self, 
+            round_id, 
+            run_id, 
+            dataset_ref, 
+            batch_size, 
+            post_update_attack_clients: list[client.Client],
+            device, 
+            test_run_calc:bool=False
+        ) -> tuple[tuple[float, float, float], list[float], int, int]:
         """
         FedCAP: Robust Federated Learning via Customized Aggregation and Personalization
         Implements server-side customization, calibration, and anomaly detection.
@@ -381,7 +474,19 @@ class Server:
             futures = [c.train(dataset_ref, batch_size, device, round_id) for c in selected]
             local_results_pre = ray.get(futures)  # List of (state_dict, cid)
             train_end = time.time()
-            local_results = [(i[0][0], i[1]) for i in local_results_pre]
+
+            for (state, _), cid in local_results_pre:
+                self.clients[cid].model_state = state
+
+            for attack_client in post_update_attack_clients:
+                if attack_client.attack is not None:
+                    attack_client.attack.perform_general_post_update_attack(
+                        self.clients,
+                        len(self.clients),
+                        self.client_types[attack_client.atack_type]
+                    )
+
+            local_results = [(c.model_state, c.cid) for c in self.clients]
 
         alg_continue = time.time()
         
@@ -406,7 +511,6 @@ class Server:
                 recovered_models[client_.cid] = client_.model_state
                 diff_state = self._state_diff(client_.model_state, self.global_model_state)
                 calibrated_updates[client_.cid] = stats.flatten(diff_state) # pyright: ignore[reportArgumentType]
-            
         # =========================================================================
         # STEP 5: Anomaly Detection (Section V-C)
         # Detect malicious clients by thresholding Euclidean norm of calibrated updates

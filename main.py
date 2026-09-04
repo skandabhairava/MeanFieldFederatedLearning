@@ -380,10 +380,9 @@ if __name__ == "__main__":
     # folder_to_test = "RUN_Sat_Jul_25_16-19-27_2026_backdoor_pathalogical_cap"
     # folder_to_test = "RUN_Sat_Jul_25_18-36-25_2026_backdoor_avg"
 
-
     main(
-        TrainProtocol.FedAttract, 
-        "normal_fedattract_pathalogical_dropout50", 
+        TrainProtocol.FedCap,
+        "alie30_fedcap_pathalogical", 
         test_run_calc=False,
         data_distribution=DataDistribution.Pathological
     )

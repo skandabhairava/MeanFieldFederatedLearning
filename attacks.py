@@ -1,4 +1,5 @@
 from collections import OrderedDict
+import math
 
 import torch
 import models
@@ -10,8 +11,11 @@ import data
 import random
 import copy
 import config
-import client
 from client_types import ClientTypes
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    import client
 
 # log = logging.getLogger("attacks")
 
@@ -29,26 +33,54 @@ class Attack:
     def apply(self, x: torch.Tensor, y: torch.Tensor, modify_y: bool=False) -> tuple[torch.Tensor, torch.Tensor]:
         return x, y
 
+    @staticmethod
+    def perform_general_post_update_attack(
+        clients: list['client.Client'],
+        n_total_in_round: int,
+        n_byzantine_in_round: int,
+    ) -> None:
+        return None
+
 class ALIEAttack(Attack):
     global_model_state: None|models.StateDict = None
     def __init__(self, name):
         self.name = name
         self.prepared = False
 
-    def manipulate_update(self, update: torch.Tensor, global_layer: torch.Tensor, param_name: str|None=None, round_id: int|None=None) -> torch.Tensor:
-        return update
-    
-    def prepare(self, ref_state_dict: models.StateDict, model: type[torch.nn.Module], dataset, split) -> None:
-        self.prepared = True
+    @staticmethod
+    def compute_z_max(n_total_in_round: int, n_byzantine_in_round: int) -> float:
+        """
+        Compute ALIE z_max using the inverse standard normal CDF.
+        No scipy needed — uses torch.erfinv.
+        """
+        n = n_total_in_round
+        m = n_byzantine_in_round
+        n_benign = n - m
 
-    def apply(self, x: torch.Tensor, y: torch.Tensor, modify_y: bool=False) -> tuple[torch.Tensor, torch.Tensor]:
-        return x, y
+        if n_benign <= 0:
+            return 5.0
 
-    @classmethod
-    def perform_alie_attack(
-            cls,
-            clients: list[client.Client],
-            z: float = 0.1
+        majority_threshold = math.floor(n / 2 + 1)
+        s = majority_threshold - m
+
+        if s <= 0:
+            return 5.0
+
+        # Probability threshold: (n - m - s) / (n - m)
+        prob = (n - m - s) / (n - m)
+
+        # Φ⁻¹(p) = √2 * erfinv(2p - 1)
+        p_t = torch.tensor(prob, dtype=torch.float64)
+        z_max = (math.sqrt(2) * torch.erfinv(2 * p_t - 1)).item()
+
+        return z_max
+
+    @staticmethod
+    def perform_general_post_update_attack(
+            clients: list['client.Client'],
+            n_total_in_round: int,
+            n_byzantine_in_round: int,
+            z: float|None = None#0.2
         ):
         """
         Perform the ALIE (A Little Is Enough) attack on clients marked with client_type == ALIE.
@@ -62,7 +94,10 @@ class ALIEAttack(Attack):
             z: The scaling factor for the standard deviation in the attack (default: 0.1).
         """
 
-        assert cls.global_model_state is not None, "Global model in ALIE attack is None"
+        assert ALIEAttack.global_model_state is not None, "Global model in ALIE attack is None"
+
+        if z is None:
+            z = ALIEAttack.compute_z_max(n_total_in_round, n_byzantine_in_round)
 
         # Separate benign clients (non-ALIE) and malicious clients (ALIE)
         benign_clients = [c for c in clients if c.client_type != ClientTypes.ALIE]
@@ -77,9 +112,9 @@ class ALIEAttack(Attack):
         benign_updates = []
         for client in benign_clients:
             update = OrderedDict()
-            for key in cls.global_model_state.keys():
+            for key in ALIEAttack.global_model_state.keys():
                 # Ensure both are on the same device (move to CPU for simplicity)
-                global_param = cls.global_model_state[key]#.cpu()
+                global_param = ALIEAttack.global_model_state[key]#.cpu()
                 client_param = client.model_state[key]#.cpu()
                 update[key] = client_param - global_param
             benign_updates.append(update)
@@ -88,7 +123,7 @@ class ALIEAttack(Attack):
         # Initialize mean_dict and std_dict as zero tensors
         mean_dict = OrderedDict()
         std_dict = OrderedDict()
-        for key in cls.global_model_state.keys():
+        for key in ALIEAttack.global_model_state.keys():
             # Stack all benign updates for this parameter (shape: [num_benign, *param_shape])
             stacked = torch.stack([upd[key] for upd in benign_updates], dim=0)
             mean_dict[key] = stacked.mean(dim=0)
@@ -97,13 +132,13 @@ class ALIEAttack(Attack):
         # For each malicious client, compute the poisoned update: mean - z * std
         for mal_client in malicious_clients:
             poisoned_update = OrderedDict()
-            for key in cls.global_model_state.keys():
+            for key in ALIEAttack.global_model_state.keys():
                 # Compute malicious update for this parameter
                 mal_update = mean_dict[key] - z * std_dict[key]
                 # The client's new model state = global_model + malicious_update
                 # Move to the same device as the original model_state if needed
                 device = mal_client.model_state[key].device
-                poisoned_update[key] = (cls.global_model_state[key] + mal_update).to(device)
+                poisoned_update[key] = (ALIEAttack.global_model_state[key] + mal_update).to(device)
 
             # Replace the client's model_state with the poisoned one
             mal_client.model_state = poisoned_update
