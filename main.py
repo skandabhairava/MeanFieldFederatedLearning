@@ -273,6 +273,43 @@ def blind_test_backdoor_topology(folder_name):
 
     print_tree(topology)    
 
+def PRINT_TREE(folder_name):
+    import torch
+    lib.set_all_seeds(config.RANDOM_SEED)
+    lib.set_log_level(log.INFO)
+
+    file = "topology.top"
+    with open(f"logs/{folder_name}/{file}", "rb") as f:
+        topology = torch.load(f)
+
+    def print_tree(tree, prefix="", is_last=True):
+        connector = "└── " if is_last else "├── "
+        # indent = "  " * level
+
+        if tree["type"] == "Client":
+            # print(f"{indent}Client {tree['cid']}")
+            return
+        
+        members = tree.get("members", {})
+        log.info(f"{prefix}{connector}Cluster #{tree['cid']} with {len(members)} children")
+
+        model_state = tree["model_state"] # model state of the cluster
+
+        # Check if this is a leaf cluster
+        if all(member["type"] == "Client" for member in members.values()):
+            cids = [str(member["cid"]) for member in members.values()]
+            log.info(f"{prefix}{connector} -- Clients: {', '.join(cids)}")
+
+            for client in members.values():
+                with open(f"logs/{folder_name}/{client["model_state_file"]}", "rb") as f:
+                    model_state = torch.load(f) # model state of the client
+        else:
+            child_prefix = prefix + ("    " if is_last else "│   ")
+            for i, member in enumerate(members.values()):
+                print_tree(member, prefix=child_prefix, is_last=(i == len(members) - 1))
+
+    print_tree(topology)
+
 def evaluate_entropy(folder_name):
     import torch
 

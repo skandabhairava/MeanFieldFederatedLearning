@@ -102,7 +102,7 @@ class Cluster:
             total_dist += d
         return dists, total_dist
 
-    def update_centers_upward(self, updated_client_states: dict[int, models.StateDict], use_softmax=False) -> int:
+    def update_centers_upward(self) -> int:
         """
         Recursively update cluster centers from leaves upward.
         updated_client_states: dict mapping client.cid -> new state_dict (after local training).
@@ -116,25 +116,13 @@ class Cluster:
                 member_states[m.cid] = (m.model_state, m.model_state_flattened)
             else:
                 # Recursively update child cluster
-                bigo_t += m.update_centers_upward(updated_client_states, use_softmax=use_softmax)
+                bigo_t += m.update_centers_upward()
                 # After child cluster updated, its center is new
                 member_states[m.cid] = m.model_state, m.model_state_flattened
 
         # Now compute distances for this cluster
         bigo_t += len(member_states)
         self.dists, self.total_dist = self.calc_distances(member_states)
-
-        if use_softmax:
-            self.model_state = Cluster.attract_aggregate_softmax(
-                member_states, self.dists, self.model_state, self.total_dist
-            )
-            self.model_state_flattened = self.project_func(
-                stats.flatten(self.model_state),
-                self.model_state_flattened,
-                True,
-                False
-            )
-            return bigo_t
 
         self.model_state = Cluster.attract_aggregate(
             member_states, self.dists, self.model_state, self.total_dist
@@ -147,13 +135,24 @@ class Cluster:
         )
         return bigo_t
 
-    def propagate_downward(self) -> int:
+    def propagate_downward(self, recalc_dists: bool) -> tuple[int, int]:
         """
         From root downward, update child clusters and clients using the new center and distances.
         """
         # First update this cluster's own members (clients or child clusters)
         inv_total = 1.0 / self.total_dist if self.total_dist > 0 else 0.0
         bigo_s = 1
+        bigo_t = 0
+
+        if recalc_dists:
+            member_states: dict[int, tuple[models.StateDict, torch.Tensor]] = {
+                mcid: (m.get_model_state(), m.get_model_state_flattened()) 
+                for mcid, m in self.members.items()
+            }
+
+            bigo_t += len(member_states)
+            self.dists, self.total_dist = self.calc_distances(member_states)
+
         for cid, m in self.members.items():
             # Find distance for this member
             # Find matching dist
@@ -186,9 +185,11 @@ class Cluster:
                     True
                 )
                 # Also update child's distances? Not needed; child will recompute when propagate_downward called on it.
-                bigo_s += m.propagate_downward()
+                bigo_s_, bigo_t_ = m.propagate_downward(recalc_dists)
+                bigo_s += bigo_s_
+                bigo_t += bigo_t_
 
-        return bigo_s
+        return bigo_s, bigo_t
 
     def print_tree(self, level=0):
         indent = "  " * level

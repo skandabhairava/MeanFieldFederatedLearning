@@ -130,7 +130,7 @@ class Server:
                     run_id, 
                     dataset_ref, 
                     batch_size, 
-                    [ALIE_clients[0]],
+                    ALIE_clients[:1],
                     device, 
                     test_run_calc
                 )
@@ -140,7 +140,7 @@ class Server:
                     run_id, 
                     dataset_ref, 
                     batch_size, 
-                    [ALIE_clients[0]],
+                    ALIE_clients[:1],
                     device
                 )
             elif train_protocol == TrainProtocol.FedKrum:
@@ -149,7 +149,7 @@ class Server:
                     run_id, 
                     dataset_ref, 
                     batch_size, 
-                    [ALIE_clients[0]],
+                    ALIE_clients[:1],
                     device,
                 )
             elif train_protocol == TrainProtocol.FedCap:
@@ -158,7 +158,7 @@ class Server:
                     run_id, 
                     dataset_ref, 
                     batch_size, 
-                    [ALIE_clients[0]],
+                    ALIE_clients[:1],
                     device, 
                     test_run_calc
                 )
@@ -226,6 +226,8 @@ class Server:
                     shift_diffs=True
                 )
 
+            train_end = time.time()
+
             for attack_client in post_update_attack_clients:
                 if attack_client.attack is not None:
                     attack_client.attack.perform_general_post_update_attack(
@@ -233,14 +235,8 @@ class Server:
                         len(self.clients),
                         self.client_types[attack_client.atack_type]
                     )
-    
-            # log.info(f"\t\tTime taken to copy updates: {time.time() - start}")
 
-            train_end = time.time()
-
-            updated_states = {cid: sd[0] for sd, cid in local_sds__cid}
-        else:
-            updated_states = {c.cid: c.model_state for c in self.clients}
+            
 
         alg_start = time.time()
         if round_id % config.ATTRACT_SPLIT_EVERY == 0:
@@ -248,6 +244,9 @@ class Server:
 
         bigo_t += self.global_cluster.update_centers_upward(updated_states, use_softmax=False)
         bigo_s += self.global_cluster.propagate_downward()
+        bigo_s_, bigo_t_ = self.global_cluster.propagate_downward(recalc_dists=False)
+        bigo_s += bigo_s_
+        bigo_t += bigo_t_
         alg_end = time.time()
 
         if not test_run_calc:

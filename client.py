@@ -29,10 +29,11 @@ class Client:
             model_state: models.StateDict, 
             client_type: ClientTypes=ClientTypes.NORMAL, 
             save_log: bool = True,
+            verifying_so_remove_splits: bool = False,
             seed=42
         ):
         self.cid = cid
-        self.split = splits[cid]
+        self.split = ([], []) if verifying_so_remove_splits else splits[cid]
         self.client_type: ClientTypes = client_type
         # self.model_state: StateDictPtr = StateDictPtr(model_state, project_func)
         self.model_state = copy.deepcopy(model_state)
@@ -86,7 +87,7 @@ class Client:
         }
 
     @staticmethod
-    def sample_types(n, proportions: dict[ClientTypes, float]) -> list[str]:
+    def sample_types(n, proportions: dict[ClientTypes, float]) -> list[ClientTypes]:
         assert abs(1 - sum(proportions.values())) < 0.01, "Float values MUST add up to 1"
 
         names = list(proportions.keys())
