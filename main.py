@@ -3,6 +3,7 @@ import pickle
 import types as typ
 from enum import Enum
 import types
+from multiprocessing import Process, Queue
 
 import os
 import ray
@@ -18,6 +19,7 @@ from server import Server, TrainProtocol
 
 # from dataset_analysis import analyze_feature_similarity
 from collections import Counter
+import gui
 
 class DataDistribution(Enum):
     Pathological = 1

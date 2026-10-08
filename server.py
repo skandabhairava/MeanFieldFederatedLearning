@@ -109,6 +109,23 @@ class Server:
 
         log.info("selecting dims")
         self.R = torch.randn(D, self.proj_dim, generator=g) / (self.proj_dim ** 0.5)
+        self.DISP_R = torch.randn(D, 2, generator=g) / (2 ** 0.5)
+
+        # weights = []
+        # model_state = model.state_dict()
+        # log.info("calcing weights")
+        # for k in sorted(model_state.keys()):
+        #     weights.append(
+        #         torch.full(
+        #             (model_state[k].numel(),),
+        #             models.get_weight(k),
+        #             dtype=torch.float32,
+        #         )
+        #     )
+
+        # weights = torch.cat(weights)
+        # self.R = self.R * weights[:, None]
+        # log.info(f"weights: {weights}")
 
         self.clients = [
             client.Client(
@@ -464,10 +481,24 @@ class Server:
                     attack_client.attack.perform_general_post_update_attack(
                         self.clients,
                         len(self.clients),
-                        self.client_types[attack_client.atack_type]
+                        self.client_types[attack_client.client_type],
+                        round_id
                     )
+            # self.norm_client = random.choice(self.HONEST_clients)
+            max_norm = Server.get_norm(self.norm_client.get_model_state(), old_models[self.norm_client.cid])
+            for c in selected:
+                Server.clip_state_dict_distance(c.get_model_state(), old_models[c.cid], max_norm)
 
-            
+            log.info(f"Clipped to norm {max_norm}", extra={"save": True})
+
+            if self.spill_to_disk:
+                self.switch_clients_to_disk()
+
+        dic: dict[int, tuple[None|str, bool, tuple[float, float]]] = {}
+        self.global_cluster.get_2dpos(dic)
+
+        gui.queue.put([(i[2], i[0], i[1]) for i in dic.values()])
+        del dic
 
         alg_start = time.time()
         if round_id % config.ATTRACT_SPLIT_EVERY == 0:
@@ -786,6 +817,12 @@ class Server:
             local_results = [(c.get_model_state(), c.cid) for c in self.clients]
 
         alg_continue = time.time()
+
+        dic: dict[int, tuple[None|str, bool, tuple[float, float]]] = {}
+        self.global_cluster.get_2dpos(dic)
+
+        gui.queue.put([(i[2], i[0], i[1]) for i in dic.values()])
+        del dic
         
         # =========================================================================
         # STEP 4: Recovery and Calibration (Section V-C)
@@ -882,7 +919,7 @@ class Server:
             eval_results = ray.get(eval_futures)
             acc_end = time.time()
             # eval_results.sort(key=lambda x: x[1])
-            accs, _, _ = zip(*eval_results)
+            accs, _, _, _ = zip(*eval_results)
 
         bigo_s = (len(self.calibrated_update_pool) + len(self.recovered_model_pool) + 1) * self.W
 
