@@ -19,12 +19,47 @@ import data
 import topology
 import comparision_algorithms
 from client_types import ClientTypes
-from attacks import ALIEAttack
+from attacks import ALIEAttack, IPMAttack, LabelSwitchAttack
 
 import copy
 import math
 
 ModelState = tuple[models.StateDict, int]
+
+def find_size(obj, seen=None):
+    if seen is None:
+        seen = set()
+
+    obj_id = id(obj)
+
+    # Avoid double-counting the same object
+    if obj_id in seen:
+        return 0
+
+    seen.add(obj_id)
+
+    size = sys.getsizeof(obj)
+
+    if isinstance(obj, dict):
+        size += sum(
+            find_size(k, seen) + find_size(v, seen)
+            for k, v in obj.items()
+        )
+
+    elif isinstance(obj, (list, tuple, set, frozenset)):
+        size += sum(find_size(item, seen) for item in obj)
+
+    elif hasattr(obj, "__dict__"):
+        size += find_size(obj.__dict__, seen)
+
+    elif hasattr(obj, "__slots__"):
+        for slot in obj.__slots__:
+            try:
+                size += find_size(getattr(obj, slot), seen)
+            except AttributeError:
+                pass
+
+    return size
 
 class TrainProtocol(Enum):
     FedAttract = 1
@@ -254,8 +289,6 @@ class Server:
         bigo_ts = []
         bigo_ss = []
 
-        ALIE_clients = [c for c in self.clients if c.atack_type == ClientTypes.ALIE]
-
         for round_id in range(1, config.ROUNDS+1):
             if len(self.ALIE_clients) != 0:
                 ALIEAttack.global_model_state = topology.Cluster.avg_model_states([(c.cid, c.get_model_state()) for c in self.clients])  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
@@ -271,7 +304,7 @@ class Server:
                     run_id, 
                     dataset_ref, 
                     batch_size, 
-                    ALIE_clients[:1],
+                    self.ALIE_clients[:1] + self.IPM_clients[:1],
                     device, 
                     test_run_calc
                 )
@@ -281,7 +314,7 @@ class Server:
                     run_id, 
                     dataset_ref, 
                     batch_size, 
-                    ALIE_clients[:1],
+                    self.ALIE_clients[:1] + self.IPM_clients[:1],
                     device
                 )
             elif train_protocol == TrainProtocol.FedKrum:
@@ -290,7 +323,7 @@ class Server:
                     run_id, 
                     dataset_ref, 
                     batch_size, 
-                    ALIE_clients[:1],
+                    self.ALIE_clients[:1] + self.IPM_clients[:1],
                     device,
                 )
             elif train_protocol == TrainProtocol.FedCap:
@@ -299,7 +332,7 @@ class Server:
                     run_id, 
                     dataset_ref, 
                     batch_size, 
-                    ALIE_clients[:1],
+                    self.ALIE_clients[:1] + self.IPM_clients[:1],
                     device, 
                     test_run_calc
                 )
@@ -383,8 +416,7 @@ class Server:
                     shift_diffs=True
                 )
 
-            train_end = time.time()
-
+            print(f"attacks passed to fedattract: {post_update_attack_clients}, round: {round_id}")
             for attack_client in post_update_attack_clients:
                 if attack_client.attack is not None:
                     attack_client.attack.perform_general_post_update_attack(
@@ -420,8 +452,7 @@ class Server:
                 self.switch_clients_to_disk()
 
             accs.sort(key=lambda x: x[1])
-            # accs_, _, counters = zip(*accs)
-            accs_, _, counters = zip(*accs)
+            accs_, _, counters, _extra = zip(*accs)
 
             if counters[0] is not None:
                 final_counter = reduce(lambda x, y: x+y, counters)
@@ -458,7 +489,8 @@ class Server:
                 attack_client.attack.perform_general_post_update_attack(
                     self.clients,
                     len(self.clients),
-                    self.client_types[attack_client.atack_type]
+                    self.client_types[attack_client.client_type],
+                    round_id
                 )
 
         alg_start = time.time()
@@ -477,8 +509,7 @@ class Server:
         accs = ray.get([c.evaluate(dataset_ref, batch_size, device) for c in self.clients if c.client_type == client.ClientTypes.NORMAL]) # list[tuple[float, client_id#int]]
         acc_end = time.time()
         
-        # accs.sort(key=lambda x: x[1])
-        accs_, _, _ = zip(*accs)
+        accs_, _, _, _ = zip(*accs)
 
         accs_lis = list(accs_)
 
@@ -510,15 +541,18 @@ class Server:
 
         for attack_client in post_update_attack_clients:
             if attack_client.attack is not None:
-                    attack_client.attack.perform_general_post_update_attack(
-                        self.clients,
-                        len(self.clients),
-                        self.client_types[attack_client.atack_type]
-                    )
+                attack_client.attack.perform_general_post_update_attack(
+                    self.clients,
+                    len(self.clients),
+                    self.client_types[attack_client.client_type],
+                    round_id
+                )
 
         alg_start = time.time()
         new_global = comparision_algorithms.krum_aggregate_adaptive([(c.cid, c.model_state) for c in self.clients])
         alg_end = time.time()
+
+        log.info(f"Client Selected Krum: {client_sel} | {self.clients[client_sel].client_type if client_sel >= 0 else 'median selected'}")
 
         # start = time.time()
         for c in self.clients:
@@ -533,7 +567,7 @@ class Server:
         acc_end = time.time()
         
         # accs.sort(key=lambda x: x[1])
-        accs_, _, _ = zip(*accs)
+        accs_, _, _, _ = zip(*accs)
 
         accs_lis = list(accs_)
 
@@ -652,7 +686,8 @@ class Server:
                     attack_client.attack.perform_general_post_update_attack(
                         self.clients,
                         len(self.clients),
-                        self.client_types[attack_client.atack_type]
+                        self.client_types[attack_client.client_type],
+                        round_id
                     )
 
             local_results = [(c.get_model_state(), c.cid) for c in self.clients]

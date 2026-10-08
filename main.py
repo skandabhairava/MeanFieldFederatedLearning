@@ -201,6 +201,200 @@ def test_backdoor(folder_name):
 
         log.info(f"\t STD: {np.array(accs_lis).std()}")
 
+def test_labelswitch(folder_name):
+    import torch
+    import client    
+    import stats
+    from functools import reduce
+    import numpy as np
+    import data
+    import json
+
+    client_splits, combined_data, full_features = default()
+
+    folder_to_test = folder_name
+
+    models_str = [f"logs/{folder_to_test}/{i}" for i in os.listdir(f"logs/{folder_to_test}") if i.endswith(".pth")]
+
+    client_saves = []
+    for m in models_str:
+        with open(m, "rb") as f:
+            client_saves.append(torch.load(f))
+    with open(f"logs/{folder_name}/label_switch.json", "r") as f:
+        label_switch = json.load(f)
+
+    types = Client.sample_types(config.NUM_CLIENTS, config.CLIENT_TYPES)
+
+    clients = [
+        client.Client(
+            i, 
+            client_splits, 
+            lambda x:x, 
+            client_saves[i], 
+            "spill",
+            types[i], 
+            save_log=False, 
+            seed=config.RANDOM_SEED
+        ) # pyright: ignore[reportArgumentType]
+        for i in range(len(client_saves))
+    ]
+
+    dataset_ref = ray.put(combined_data)
+    batch_size = ray.put(config.BATCH_SIZE)
+    device = ray.put(config.DEVICE)
+    accs = ray.get([c.evaluate(
+        dataset_ref, 
+        batch_size, 
+        device, 
+        should_attack=True, 
+        # should_attack=False, 
+        calc_counts=True
+        ) for c in clients if c.client_type != ClientTypes.LABEL_SWITCH])
+    del dataset_ref
+    del batch_size
+    del device
+
+    accs.sort(key=lambda x: x[1])
+    accs_, cids, zipp, _ = zip(*accs)
+    accs_lis = list(accs_)
+
+    attack_rate = [0, 0] # (num of instances where real == s, but pred == t)/(num instances of real == s, in our case = 100%, as we simulate ALL classes being swapped)
+    ## labelswitch s->t
+
+    # print(zipp)
+    for c, zipp_res in enumerate(zipp):
+        for pred, real in zipp_res:
+            attack_rate[1] += 1
+
+            if pred == int(label_switch[str(real)]):
+                attack_rate[0] += 1
+
+    acc = stats.avg(accs_lis)
+    log.info(f"\tAccuracy: {acc*100:.2f}% | {len(accs_lis)} total clients evaluated.")
+    log.info(f"\tAttack rate: {attack_rate[0]/attack_rate[1]}")
+
+def generalize_test(run_log_dir):
+    import json
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+    import seaborn as sns
+    import pandas as pd
+
+    file = config.LOG_DIR + "/" + run_log_dir + "/generalization.json"
+    with open(file, "r") as f:
+        gen_data: dict[str, dict[str, dict[str, float]]] = json.load(f)
+
+    acc = pd.DataFrame({
+        row: {col: values["acc"] for col, values in cols.items()}
+        for row, cols in gen_data.items()
+    }).T
+    ax = sns.heatmap(acc, cmap="viridis")
+    # Mark cells where main != "normal"
+    for i, row in enumerate(acc.index):
+        for j, col in enumerate(acc.columns):
+            if gen_data[row][col]["main_client_type"] != "normal":
+                ax.add_patch(
+                    Rectangle(
+                        (j, i), 1, 1,
+                        fill=False,
+                        edgecolor="red",
+                        linewidth=3
+                    )
+                )
+                ax.text(
+                    j + 0.5, i + 0.5,
+                    "X",
+                    color="red",
+                    fontsize=20,
+                    ha="center",
+                    va="center"
+                )
+
+    clients = len(acc)
+
+    plt.xlabel("Datasets")
+    plt.ylabel("Models")
+    plt.show()
+
+    verify_acc = [data["acc"] for i, J in gen_data.items() for j, data in J.items() if i == j and data["main_client_type"] == "normal"]
+    verify_acc = sum(verify_acc)/len(verify_acc)
+
+    personalization = sum([data["acc"] for i, J in gen_data.items() for j, data in J.items() if i == j])/clients
+    cross = sum([data["acc"] for i, J in gen_data.items() for j, data in J.items() if i != j])/((clients*(clients-1)))
+
+    print(f"Accuracy only on Normal clients: {verify_acc}\n")
+    print(f"Personalized Accuracy: {personalization}")
+    print(f"Generalized Accuracy: {cross}\n")
+
+    print(f"Personalization Gain: {personalization-cross} % points")
+    print(f"Cross-client accuracy retention: {cross/personalization}")
+
+    personalization = [data["acc"] for i, J in gen_data.items() for j, data in J.items() if i == j and data["main_client_type"] == "normal"]
+    cross = [data["acc"] for i, J in gen_data.items() for j, data in J.items() if i != j and data["main_client_type"] == "normal"]
+
+    personalization = sum(personalization)/len(personalization)
+    cross = sum(cross)/len(cross)
+
+    print(f"\n\nNORMAL ONLY:\nPersonalized Accuracy: {personalization}")
+    print(f"Generalized Accuracy: {cross}\n")
+
+    print(f"Personalization Gain: {personalization-cross} % points")
+    print(f"Cross-client accuracy retention: {cross/personalization}")
+
+    personalization = [data["acc"] for i, J in gen_data.items() for j, data in J.items() if i == j and data["main_client_type"] == "normal"]
+    cross = [data["acc"] for i, J in gen_data.items() for j, data in J.items() if i != j and data["main_client_type"] == "normal" and data["sec_client_type"] == "normal"]
+
+    personalization = sum(personalization)/len(personalization)
+    cross = sum(cross)/len(cross)
+
+    print(f"\n\nBOTH NORMAL ONLY:\nPersonalized Accuracy: {personalization}")
+    print(f"Generalized Accuracy: {cross}\n")
+
+    print(f"Personalization Gain: {personalization-cross} % points")
+    print(f"Cross-client accuracy retention: {cross/personalization}")
+    
+def run_generalize(run_log_dir, data_distribution: DataDistribution):
+    import torch
+    module__ = datap
+    if data_distribution == DataDistribution.Pathological:
+        module__ = datap
+    elif data_distribution == DataDistribution.Dirchlet:
+        module__ = data2
+
+    client_splits, combined_data, full_features = default(None, module__)
+    # print(client_splits[0][0][:10])
+    # return
+    types = Client.sample_types(config.NUM_CLIENTS, config.CLIENT_TYPES)
+
+    log.info(f"Sampled clients: {Counter(types)}")
+
+    model = models.get_model()
+
+    server = Server(
+        model, 
+        types, 
+        client_splits, 
+        config.NUM_CLIENTS,
+        spill_to_disk=False,
+        spill_folder="spill", 
+        seed=config.RANDOM_SEED
+    )
+
+    folder = config.LOG_DIR + "/" + run_log_dir
+
+    models_str = [f"{folder}/{i}" for i in os.listdir(folder) if i.endswith(".pth")]
+    models_str__cid = [(i, int((i.split("/")[-1]).split("_")[0])) for i in models_str] #sorted(models_str, key=lambda x: int((x.split("/")[-1]).split("_")[0]))
+    for m, cid in models_str__cid:
+        with open(m, "rb") as f:
+            server.clients[cid].model_state = torch.load(f)
+
+    dataset_ref = ray.put(combined_data)
+    batch_size = ray.put(config.BATCH_SIZE)
+    device = ray.put(config.DEVICE)
+
+    log.info("Starting Generalizaion Matrix")
+    server.run_generalization_matrix_eval(dataset_ref, batch_size, device, folder)
+
 def blind_test_backdoor(folder_name):
     import torch
     import test_backdoor as tb

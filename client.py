@@ -1,3 +1,5 @@
+import os
+
 import ray
 import torch
 import numpy as np
@@ -15,7 +17,7 @@ from data import ClientSplit
 from client_types import ClientTypes
 import stats
 
-from typing import Callable
+from typing import Callable, Optional
 import logging as log
 
 ModelState = tuple[models.StateDict, int]
@@ -58,6 +60,25 @@ class Client:
             self.attack = attacks.LabelSwitchAttack("label_switch", 10)
         elif client_type == ClientTypes.ALIE:
             self.attack = attacks.ALIEAttack("alie")
+        elif client_type == ClientTypes.IPM:
+            self.attack = attacks.IPMAttack("ipm")
+        elif client_type == ClientTypes.MODEL_REPLACE_POS:
+            self.attack = attacks.ModelReplace("model_replace_pos")
+        elif client_type == ClientTypes.RANDOM:
+            self.attack = attacks.Random("random")
+        elif client_type == ClientTypes.SIGN_FLIP:
+            self.attack = attacks.SignFlipping("sign_flip")
+
+        # elif client_type == ClientTypes.LATE_SUBTLE:
+        #     self.attack = attacks.SubtleAttack("subtle", start=config.ROUNDS//2)
+        # elif client_type == ClientTypes.LATE_BACKDOOR_0:
+        #     self.attack = attacks.BackdoorAttack("backdoor_0", 3, 0.3, 0, start=config.ROUNDS//2)
+        # elif client_type == ClientTypes.LATE_LABEL_SWITCH:
+        #     self.attack = attacks.LabelSwitchAttack("label_switch", 10, start=config.ROUNDS//2)
+        # elif client_type == ClientTypes.LATE_ALIE:
+        #     self.attack = attacks.ALIEAttack("alie", start=config.ROUNDS//2)
+        # elif client_type == ClientTypes.LATE_IPM:
+        #     self.attack = attacks.IPMAttack("ipm", start=config.ROUNDS//2)
 
         if save_log:
             log.info(f"Client {self.cid} has been assigned type: {client_type}", extra={"save": True})
@@ -99,9 +120,19 @@ class Client:
 
     def train(self, dataset: Dataset, batch_size, device, round_id: int):
         # return train.remote(self.model_state.state_dict, self.split, dataset, batch_size, device, self.attack, self.cid)
-        return train.remote(self.model_state, self.split, dataset, batch_size, device, self.attack, self.cid, round_id)
+        for i in [ClientTypes.ALIE, ClientTypes.IPM]:
+            if self.client_type == i:
+                return train_dummy.remote(self.get_model_state(), self.split, dataset, batch_size, device, self.attack, self.cid, round_id)
 
-    def evaluate(self, dataset: Dataset, batch_size, device, should_attack: bool=False, calc_counts: bool=False):
+        if round_id >= config.ROUNDS//2:
+            for i in [ClientTypes.LATE_ALIE, ClientTypes.LATE_IPM]:
+                if self.client_type == i:
+                    return train_dummy.remote(self.get_model_state(), self.split, dataset, batch_size, device, self.attack, self.cid, round_id)
+        return train.remote(self.get_model_state(), self.split, dataset, batch_size, device, self.attack, self.cid, round_id)
+
+    def evaluate(self, dataset: Dataset, batch_size, device, should_attack: bool=False, calc_counts: bool=False, split: ClientSplit|None=None, extra:None|int|str|dict|list=None):
+        if split is None:
+            split = self.split
         # return evaluate.remote(self.model_state.state_dict, self.split, dataset, batch_size, device, self.cid)
         return evaluate.remote(
             self.get_model_state(), 
@@ -111,7 +142,8 @@ class Client:
             device, 
             self.attack if should_attack else None, 
             calc_counts,
-            self.cid
+            self.cid,
+            extra
         )
 
     def save(self, log_save_dir: str):
@@ -128,12 +160,21 @@ class Client:
 
     @staticmethod
     def sample_types(n, proportions: dict[ClientTypes, float]) -> list[ClientTypes]:
-        assert abs(1 - sum(proportions.values())) < 0.01, "Float values MUST add up to 1"
+        assert abs(1 - sum(proportions.values())) < 0.01
 
-        names = list(proportions.keys())
-        probs = list(proportions.values())
+        result = []
 
-        return list(np.random.choice(names, size=n, p=probs))
+        for client_type, proportion in proportions.items():
+            count = round(n * proportion)
+            result.extend([client_type] * count)
+
+        np.random.shuffle(result)
+
+        return result
+
+@ray.remote(num_cpus=1)
+def train_dummy(global_sd: models.StateDict, split: ClientSplit, dataset: Dataset, batch_size: int, device: str|torch.device, attack: None|attacks.Attack, cid: int, round_id: int) -> tuple[ModelState, int]:
+    return (global_sd, 0), cid # pyright: ignore[reportArgumentType, reportReturnType]
 
 @ray.remote(num_cpus=2, num_gpus=0.5)
 def train(global_sd: models.StateDict, split: ClientSplit, dataset: Dataset, batch_size: int, device: str|torch.device, attack: None|attacks.Attack, cid: int, round_id: int) -> tuple[ModelState, int]:
@@ -150,7 +191,7 @@ def train(global_sd: models.StateDict, split: ClientSplit, dataset: Dataset, bat
     for _ in range(config.LOCAL_EPOCHS):
         for x, y in train_loader:
             if attack is not None:
-                x, y = attack.apply(x, y, modify_y=True)
+                x, y = attack.apply(x, y, round_id=round_id, modify_y=True)
             x, y = x.to(device), y.to(device)
 
             opt.zero_grad()
@@ -162,11 +203,17 @@ def train(global_sd: models.StateDict, split: ClientSplit, dataset: Dataset, bat
     # new_sd = {k: v.cpu() for k, v in new_sd.items()}
 
     if attack is not None:
+        trainable_names = {
+            name
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        }
         # convert to update space, manipulate, then reconstruct
         for k in new_sd:
-            delta: torch.Tensor = new_sd[k] - global_sd[k]            
-            delta = attack.manipulate_update(delta, global_sd[k], param_name=k, round_id=round_id)
-            new_sd[k] = global_sd[k] + delta
+            if k in trainable_names:
+                delta: torch.Tensor = new_sd[k] - global_sd[k]            
+                delta = attack.manipulate_update(delta, global_sd[k], param_name=k, round_id=round_id)
+                new_sd[k] = global_sd[k] + delta
 
     return (new_sd, len(train_loader.dataset)), cid # pyright: ignore[reportArgumentType, reportReturnType]
 
@@ -179,8 +226,9 @@ def evaluate(
         device: str|torch.device,
         attack: None|attacks.Attack,
         calc_counts: bool,
-        cid
-    ) -> tuple[float, int, Counter[int]|None]:
+        cid: int,
+        extra: int|str|list|dict|None
+    ) -> tuple[float, int, list[tuple[int, int]]|None, int|str|list|dict|None]:
     # x: torch.Tensor
     # y: torch.Tensor
 
@@ -196,13 +244,14 @@ def evaluate(
 
     if calc_counts:
         preds = []
+        real = []
 
     # print(f"{cid}: attack is applied: {attack is not None}")
     with torch.no_grad():
         # log.info(f"\tLoaded model for cid: {cid}")
         for i, (x, y) in enumerate(test_loader):
             if attack is not None:
-                x, y = attack.apply(x, y, modify_y=False)
+                x, y = attack.apply(x, y, round_id=config.ROUNDS, modify_y=False)
             x, y = x.to(device), y.to(device)
             pred = model(x).argmax(1)
 
@@ -211,9 +260,10 @@ def evaluate(
 
             if calc_counts:
                 preds.extend(pred.cpu().numpy().tolist()) # pyright: ignore[reportPossiblyUnboundVariable]
+                real.extend(y.cpu().numpy().tolist()) # pyright: ignore[reportPossiblyUnboundVariable]
 
-    counter = None
+    zipp = None
     if calc_counts:
-        counter = Counter(preds) # pyright: ignore[reportPossiblyUnboundVariable]
+        zipp = list(zip(preds, real)) # pyright: ignore[reportPossiblyUnboundVariable]
 
-    return (correct / total), cid, counter
+    return (correct / total), cid, zipp, extra

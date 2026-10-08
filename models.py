@@ -3,6 +3,7 @@ from collections import OrderedDict
 import torch
 import torch.nn as nn
 
+import stats
 
 type StateDict = OrderedDict[str, torch.Tensor]
 
@@ -50,6 +51,12 @@ class SimpleCNN(nn.Module):
         x = torch.flatten(x, 1)
         x = self.fc(x)
         return x
+
+def get_weight(name: str) -> float:
+    if "fc" in name:
+        return 5.0
+    else:
+        return 1.0
 
 def get_model():
     # m = models.resnet18(num_classes=10)

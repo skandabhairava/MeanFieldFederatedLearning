@@ -12,6 +12,7 @@ import random
 import copy
 import config
 from client_types import ClientTypes
+import stats
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -30,22 +31,81 @@ class Attack:
     def prepare(self, ref_state_dict: models.StateDict, model: type[torch.nn.Module], dataset, split) -> None:
         self.prepared = True
 
-    def apply(self, x: torch.Tensor, y: torch.Tensor, modify_y: bool=False) -> tuple[torch.Tensor, torch.Tensor]:
+    def apply(self, x: torch.Tensor, y: torch.Tensor, round_id: int, modify_y: bool=False) -> tuple[torch.Tensor, torch.Tensor]:
         return x, y
 
-    @staticmethod
     def perform_general_post_update_attack(
+        self,
         clients: list['client.Client'],
         n_total_in_round: int,
         n_byzantine_in_round: int,
+        round_id: int,
     ) -> None:
         return None
 
-class ALIEAttack(Attack):
-    global_model_state: None|models.StateDict = None
-    def __init__(self, name):
+class ModelReplace(Attack):
+    def __init__(self, name, scale: float|int = 30):
         self.name = name
         self.prepared = False
+        self.scale = scale
+
+    def manipulate_update(self, update: torch.Tensor, global_layer: torch.Tensor, param_name: str|None=None, round_id: int|None=None) -> torch.Tensor:
+        return update * self.scale
+
+class Random(Attack):
+    def __init__(self, name, start: int = 0):
+        self.name = name
+        self.prepared = False
+        self.start = start
+
+    def manipulate_update(
+            self,
+            update: torch.Tensor,
+            global_layer: torch.Tensor,
+            param_name: str|None = None,
+            round_id: int|None=None
+        ) -> torch.Tensor:
+            """
+            Apply the subtle perturbation.
+            """
+            if not self.prepared :
+                raise Exception()
+    
+            if round_id is not None and round_id < self.start:
+                return update
+
+            return update + torch.zeros_like(update).normal_(mean=0.1, std=0.1)
+
+class SignFlipping(Attack):
+    def __init__(self, name, start: int = 0):
+        self.name = name
+        self.prepared = False
+        self.start = start
+
+    def manipulate_update(
+            self,
+            update: torch.Tensor,
+            global_layer: torch.Tensor,
+            param_name: str|None = None,
+            round_id: int|None=None
+        ) -> torch.Tensor:
+            """
+            Apply the subtle perturbation.
+            """
+            if not self.prepared :
+                raise Exception()
+    
+            if round_id is not None and round_id < self.start:
+                return update
+
+            return -update
+
+class ALIEAttack(Attack):
+    global_model_state: None|models.StateDict = None
+    def __init__(self, name, start: int=0):
+        self.name = name
+        self.prepared = False
+        self.start = start
 
     @staticmethod
     def compute_z_max(n_total_in_round: int, n_byzantine_in_round: int) -> float:
@@ -75,11 +135,12 @@ class ALIEAttack(Attack):
 
         return z_max
 
-    @staticmethod
     def perform_general_post_update_attack(
+            self,
             clients: list['client.Client'],
             n_total_in_round: int,
             n_byzantine_in_round: int,
+            round_id: int,
             z: float|None = None#0.2
         ):
         """
@@ -94,14 +155,19 @@ class ALIEAttack(Attack):
             z: The scaling factor for the standard deviation in the attack (default: 0.1).
         """
 
+        if round_id < self.start:
+            return
+
         assert ALIEAttack.global_model_state is not None, "Global model in ALIE attack is None"
 
         if z is None:
             z = ALIEAttack.compute_z_max(n_total_in_round, n_byzantine_in_round)
 
+        # print(f"{n_byzantine_in_round=} | Attack {z=}")
+
         # Separate benign clients (non-ALIE) and malicious clients (ALIE)
-        benign_clients = [c for c in clients if c.client_type != ClientTypes.ALIE]
-        malicious_clients = [c for c in clients if c.client_type == ClientTypes.ALIE]
+        benign_clients = [c for c in clients if c.client_type != ClientTypes.ALIE and c.client_type != ClientTypes.LATE_ALIE]
+        malicious_clients = [c for c in clients if c.client_type == ClientTypes.ALIE or c.client_type == ClientTypes.LATE_ALIE]
 
         if not benign_clients or not malicious_clients:
             # No benign clients to compute statistics, or no malicious clients to attack
@@ -115,14 +181,14 @@ class ALIEAttack(Attack):
             for key in ALIEAttack.global_model_state.keys():
                 # Ensure both are on the same device (move to CPU for simplicity)
                 global_param = ALIEAttack.global_model_state[key]#.cpu()
-                client_param = client.model_state[key]#.cpu()
+                client_param = client.get_model_state()[key]#.cpu()
                 update[key] = client_param - global_param
             benign_updates.append(update)
 
         # Compute mean and standard deviation per parameter across benign updates
         # Initialize mean_dict and std_dict as zero tensors
-        mean_dict = OrderedDict()
-        std_dict = OrderedDict()
+        mean_dict: OrderedDict[str, torch.Tensor] = OrderedDict()
+        std_dict: OrderedDict[str, torch.Tensor] = OrderedDict()
         for key in ALIEAttack.global_model_state.keys():
             # Stack all benign updates for this parameter (shape: [num_benign, *param_shape])
             stacked = torch.stack([upd[key] for upd in benign_updates], dim=0)
@@ -130,30 +196,104 @@ class ALIEAttack(Attack):
             std_dict[key] = stacked.std(dim=0, unbiased=False)  # population std
 
         # For each malicious client, compute the poisoned update: mean - z * std
+        # z_recreate = []
+
         for mal_client in malicious_clients:
             poisoned_update = OrderedDict()
+            # z_avg = []
             for key in ALIEAttack.global_model_state.keys():
                 # Compute malicious update for this parameter
+                mask = std_dict[key] < 1e-5
+                std_dict[key][mask] = 1e-5
                 mal_update = mean_dict[key] - z * std_dict[key]
                 # The client's new model state = global_model + malicious_update
                 # Move to the same device as the original model_state if needed
-                device = mal_client.model_state[key].device
+                device = mal_client.get_model_state()[key].device
                 poisoned_update[key] = (ALIEAttack.global_model_state[key] + mal_update).to(device)
 
             # Replace the client's model_state with the poisoned one
             mal_client.model_state = poisoned_update
 
+        # shift0 = torch.norm(stats.flatten(malicious_clients[0].get_model_state()) - stats.flatten(ALIEAttack.global_model_state))
+        # shift1 = torch.norm(stats.flatten(malicious_clients[1].get_model_state()) - stats.flatten(ALIEAttack.global_model_state))
+        # shift2 = torch.norm(stats.flatten(malicious_clients[2].get_model_state()) - stats.flatten(ALIEAttack.global_model_state))
+
+        # print(f"ALIE: z={z:.3f}, poisoning {len(malicious_clients)} clients, ||shift||={shift0:.4f}, {shift1:.4f}, {shift2:.4f}")
+        # mu_n = torch.mean(torch.cat([m.flatten() for m in mean_dict.values()]))
+        # sd_n = torch.mean(torch.cat([s.flatten() for s in std_dict.values()]))
+        # print(f"||mu||={mu_n:.4f} ||sigma||={sd_n:.4f} z*||sigma||={z*sd_n:.4f} ratio={z*sd_n/mu_n:.3f}")
+
+class IPMAttack(Attack):
+    """
+    Inner Product Manipulation (Xie, Koyejo, Gupta 2019, https://arxiv.org/abs/1903.03936).
+    Byzantine clients submit  ref - epsilon * (mean(honest) - ref),
+    where `ref` is the mean of honest clients' starting states, set by the server each round.
+    """
+
+    global_model_state: models.StateDict | None = None  # set by server each round
+
+    def __init__(self, name: str = "ipm", start: int = 0):
+        super().__init__(name)
+        self.start = start
+        # print(f"Starting IPM at: {start}")
+
+    def prepare(self, ref_state_dict, model, dataset, split) -> None:
+        super().prepare(ref_state_dict, model, dataset, split)
+        IPMAttack.global_model_state = None
+
+    def perform_general_post_update_attack(
+        self,
+        clients: list['client.Client'],
+        n_total_in_round: int,
+        n_byzantine_in_round: int,
+        round_id: int
+    ) -> None:
+
+        if round_id < self.start:
+            return
+
+        ref = IPMAttack.global_model_state
+        assert ref is not None
+
+        honest, byz = [], []
+        for c in clients:
+            if c.model_state is None:
+                continue  # didn't participate this round
+            if c.client_type == ClientTypes.IPM or c.client_type == ClientTypes.LATE_IPM:
+                byz.append(c)
+            else:
+                honest.append(c)
+        if not honest or not byz:
+            return
+
+        epsilon = len(clients)
+
+        ref_flat = stats.flatten(ref).float()
+        honest_mean = torch.zeros_like(ref_flat)
+        for c in honest:  # running sum, never stacks N copies
+            honest_mean += stats.flatten(c.model_state).float().to(ref_flat.device)
+        honest_mean /= len(honest)
+
+        mal_sd = stats.unflatten(ref_flat - epsilon * (honest_mean - ref_flat), ref)
+
+        for c in byz:
+            new_sd = dict(c.model_state)  # keeps the attacker's own BN buffers
+            for k, v in mal_sd.items():
+                new_sd[k] = v.clone()
+            c.model_state = new_sd
+
 class SubtleAttack(Attack):
     layer_names_affected = []
     direction: dict[str, torch.Tensor] = {}  # will be filled in prepare()
 
-    def __init__(self, name: str, sample: float = 1.0):
+    def __init__(self, name: str, sample: float = 1.0, start: int=0):
         super().__init__(name)
         # self.epsilon = epsilon
         self.global_sd = {}
         self.shared_seed = None      # will be set in prepare
         self.sample = sample       # used only during prepare (read‑only later)
         self.copy_layer_names_affected = []
+        self.start = start
 
     def prepare(self, ref_state_dict: models.StateDict, model: type[torch.nn.Module], dataset, split):
         """
@@ -219,6 +359,9 @@ class SubtleAttack(Attack):
         if not self.prepared :
             raise Exception()
 
+        if round_id is not None and round_id < self.start:
+            return update
+
         if param_name is None:
             raise ValueError("param_name must be provided for coordinated sign computation")
         
@@ -263,12 +406,13 @@ class SubtleAttack(Attack):
 #####################################################
 
 class BackdoorAttack(Attack):
-    def __init__(self, name: str, trigger_size: int = 3, poison_fraction: float = 0.3, target_class: int = 0):
+    def __init__(self, name: str, trigger_size: int = 3, poison_fraction: float = 0.3, target_class: int = 0, start: int=0):
         super().__init__(name)
         self.trigger_size = trigger_size
         self.poison_fraction = poison_fraction
         self.target_class = target_class
         self.trigger_pattern: None|torch.Tensor = None   # will be created in prepare()
+        self.start = start
 
     def prepare(self, ref_state_dict: models.StateDict, model: type[torch.nn.Module], dataset, split) -> None:
         """Pre-compute the trigger pattern (a white square) once."""
@@ -276,11 +420,14 @@ class BackdoorAttack(Attack):
         self.trigger_pattern = torch.full((3, self.trigger_size, self.trigger_size), 1.0)
         self.prepared = True
 
-    def apply(self, x: torch.Tensor, y: torch.Tensor, modify_y: bool=False) -> tuple[torch.Tensor, torch.Tensor]:
+    def apply(self, x: torch.Tensor, y: torch.Tensor, round_id: int, modify_y: bool=False) -> tuple[torch.Tensor, torch.Tensor]:
         """Add trigger to a random subset of the batch and set their labels to target_class."""
 
         if not self.prepared or not isinstance(self.trigger_pattern, torch.Tensor):
             raise Exception()
+
+        if round_id < self.start:
+            return x, y
 
         batch_size = x.size(0)
         # Decide which samples to poison
@@ -304,9 +451,10 @@ class BackdoorAttack(Attack):
 class LabelSwitchAttack(Attack):
     label_switch = {}
 
-    def __init__(self, name: str, total_labels: int):
+    def __init__(self, name: str, total_labels: int, start: int=0):
         super().__init__(name)
         self.total_labels = total_labels
+        self.start = start
 
     def prepare(self, ref_state_dict: models.StateDict, model: type[torch.nn.Module], dataset, split) -> None:
         """Pre-compute the trigger pattern (a white square) once."""
@@ -317,11 +465,14 @@ class LabelSwitchAttack(Attack):
                 LabelSwitchAttack.label_switch[label] = rnd_label
         self.prepared = True
 
-    def apply(self, x: torch.Tensor, y: torch.Tensor, modify_y: bool=False) -> tuple[torch.Tensor, torch.Tensor]:
+    def apply(self, x: torch.Tensor, y: torch.Tensor, round_id: int, modify_y: bool=False) -> tuple[torch.Tensor, torch.Tensor]:
         """Add trigger to a random subset of the batch and set their labels to target_class."""
 
         if not self.prepared:
             raise Exception()
+
+        if round_id < self.start:
+            return x, y
 
         # x = torch.tensor([1, 2, 5, 3])
 
