@@ -4,11 +4,12 @@ import random
 import logging as log
 from functools import reduce
 from enum import Enum
+import sys
 
 import ray
 import torch
-import numpy as np
 from torch.utils.data import Dataset
+import numpy as np
 
 import stats
 import config
@@ -32,8 +33,22 @@ class TrainProtocol(Enum):
     FedCap = 4
 
 class Server:
-    def __init__(self, model: torch.nn.Module, client_types: list[str], client_splits: list[data.ClientSplit], num_clients: int, seed: int):
+    def __init__(
+            self, 
+            model: torch.nn.Module, 
+            client_types: list[ClientTypes], 
+            client_splits: list[data.ClientSplit], 
+            num_clients: int,
+            spill_to_disk: bool,
+            spill_folder: str,
+            seed: int,
+        ):
         self.model = model
+        self.spill_to_disk = spill_to_disk
+        self.spill_folder = spill_folder
+
+        if self.spill_to_disk:
+            print(f"Spilling Client states to {spill_folder} when required.")
 
         if config.USE_VELOCITY:
             self.total_proj_dim = 20
@@ -56,27 +71,58 @@ class Server:
         self.R = torch.randn(D, self.proj_dim, generator=g) / (self.proj_dim ** 0.5)
 
         self.clients = [
-            client.Client(i, client_splits, self.project, model.state_dict(), client_types[i], seed=config.RANDOM_SEED) # pyright: ignore[reportArgumentType]
+            client.Client(
+                i, 
+                client_splits, 
+                self.project, 
+                model.state_dict(), # pyright: ignore[reportArgumentType]
+                self.spill_folder,
+                client_types[i],
+                seed=config.RANDOM_SEED
+            )
             for i in range(num_clients)
         ]
         self.clients.sort(key=lambda c: c.cid)
         log.debug("Created Clients")
 
-        self.client_types = Counter([c.atack_type for c in self.clients])
+        self.client_types = Counter([c.client_type for c in self.clients])
 
-        self.global_cluster = topology.Cluster({c.cid: c for c in self.clients}, self.dist_func, self.project)
+        self.global_cluster = topology.Cluster(
+            {c.cid: c for c in self.clients}, 
+            self.dist_func, 
+            self.project,
+            self.spill_folder
+        )
+
+        self.W = models.get_size() # |w| = number of model params
+        self.W_flat = len(self.global_cluster.get_model_state_flattened())
+
+        self.ALIE_clients = [c for c in self.clients if c.client_type == ClientTypes.ALIE or c.client_type == ClientTypes.LATE_ALIE]
+        self.IPM_clients = [c for c in self.clients if c.client_type == ClientTypes.IPM or c.client_type == ClientTypes.LATE_IPM]
+        self.SUBTLE_clients = [c for c in self.clients if c.client_type == ClientTypes.SUBTLE or c.client_type == ClientTypes.LATE_SUBTLE]
+        self.HONEST_clients = [c for c in self.clients if c.client_type == ClientTypes.NORMAL]
 
         log.info("finished initing server")
     
-    def dist_func(self, client_model_state: torch.Tensor, global_model_state: torch.Tensor) -> float:
+    def dist_func(self, client_model_state: torch.Tensor, global_model_state: torch.Tensor, only_l2: bool, max_l2_dist: float|None=None) -> float:
+        # if not config.USE_VELOCITY or only_l2:
+        #     return torch.norm(global_model_state[:self.proj_dim] - client_model_state[:self.proj_dim], p=2).item()
+        assert torch.isfinite(global_model_state).all(), "global state has NaN/Inf"
+        assert torch.isfinite(client_model_state).all(), "client state has NaN/Inf"
+
         return torch.norm(global_model_state - client_model_state, p=2).item()
     
-    def project(self, vec: torch.Tensor, old_proj: torch.Tensor|None=None, shift_diffs: bool=False, add_to_current_diff: bool=False) -> torch.Tensor:
+    def project(self, vec: torch.Tensor, old_proj: torch.Tensor|None=None, shift_diffs: bool=False, add_to_current_diff: bool=False, disp: bool=False) -> torch.Tensor:
+        assert torch.isfinite(vec).all(), "projection: state has NaN/Inf"
+        if disp:
+            return (vec @ self.DISP_R)
+
         if not config.USE_VELOCITY:
             return (vec @ self.R)
 
         if old_proj is None:
-            return torch.cat([vec @ self.R, self.zero_proj, self.zero_proj, self.zero_proj])
+            new = (vec @ self.R)
+            return torch.cat([new, self.zero_proj, self.zero_proj, self.zero_proj, torch.norm(new).unsqueeze(dim=-1)])
 
         if not shift_diffs:
             new = (vec @ self.R)
@@ -85,20 +131,111 @@ class Server:
                 old_proj[(self.total_proj_dim - self.proj_dim) : self.total_proj_dim] += diff
 
             old_proj[:self.proj_dim] = new
+            old_proj[-1] = torch.norm(new)
             return old_proj
 
         new = (vec @ self.R)
         diff = new - old_proj[:self.proj_dim]
-        old_proj[:self.proj_dim] = (vec @ self.R)
+        old_proj[:self.proj_dim] = new
 
         for i in range(1, self.total_proj_dim//self.proj_dim - 1):
             old_proj[(i*self.proj_dim) : (i*self.proj_dim + self.proj_dim)] = old_proj[(i*self.proj_dim + self.proj_dim): (i*self.proj_dim + 2*self.proj_dim)]
 
         old_proj[(self.total_proj_dim - self.proj_dim) : self.total_proj_dim] = diff
+        old_proj[-1] = torch.norm(new)
 
         return old_proj
 
+    @staticmethod
+    @torch.no_grad()
+    def get_norm(state: models.StateDict, original_state: models.StateDict):
+        
+        keys = [
+            k for k in state
+            if torch.is_floating_point(state[k])
+        ]
+
+        dist_sq = torch.stack([
+            (state[k] - original_state[k]).pow(2).sum()
+            for k in keys
+        ]).sum()
+
+        dist = torch.sqrt(dist_sq)
+
+        return dist.item()
+
+    @staticmethod
+    @torch.no_grad()
+    def clip_state_dict_distance(state: models.StateDict, original_state: models.StateDict, max_norm: float):
+        """
+        Clip ||state - original_state||_2 to max_norm.
+
+        Modifies `state` in-place and returns the original norm.
+        """
+
+        keys = [
+            k for k in state
+            if torch.is_floating_point(state[k])
+        ]
+
+        dist_sq = torch.stack([
+            (state[k] - original_state[k]).pow(2).sum()
+            for k in keys
+        ]).sum()
+
+        dist = torch.sqrt(dist_sq)
+
+        if dist > max_norm:
+            scale = max_norm / dist
+
+            for k in keys:
+                state[k].copy_(
+                    original_state[k] +
+                    scale * (state[k] - original_state[k])
+                )
+
+        return dist.item()
+
+    def switch_clients_to_disk(self):
+        for c in self.clients:
+            c.save_model_state()
+            c.save_model_state_flattened()
+            c.in_memory_swapped = False
+            c.model_state = None
+            c.model_state_flattened = None
+
+    def switch_clients_to_memory(self):
+        for c in self.clients:
+            c.model_state = c.get_model_state()
+            c.model_state_flattened = c.get_model_state_flattened()
+            c.in_memory_swapped = True
+
+    def run_generalization_matrix_eval(self, dataset_ref: Dataset, batch_size: int, device: str, log_save_dir: str):
+        eval_runs_out = []
+        for ii, c1 in enumerate(self.clients, start=1):
+            eval_runs = []
+            for c2 in self.clients:
+                eval_runs.append(c1.evaluate(dataset_ref, batch_size, device, should_attack=False, calc_counts=False, split=c2.split, extra=c2.cid))
+            
+            eval_runs_out.extend(ray.get(eval_runs))
+            log.info(f"{ii*len(self.clients)}/{len(self.clients)**2} Done.")
+        # accs, cids, classes, out_cid = zip(*eval_runs_out)
+
+        out_dict = {}
+        for (acc, main_cid, _clss, sec_cid) in eval_runs_out:
+            res = out_dict.setdefault(main_cid, {}).setdefault(sec_cid, {})
+            res["acc"] = acc*100
+            res["main_client_type"] = str(self.clients[main_cid].client_type)
+            res["sec_client_type"] = str(self.clients[sec_cid].client_type)
+            log.info(f"{main_cid}|{res["main_client_type"]} client w/ {sec_cid}|{res["sec_client_type"]}: {acc*100:.2f}%")
+
+        with open(f"{log_save_dir}/generalization.json", "w") as f:
+            import json
+            json.dump(out_dict, f)
+
     def train(self, train_protocol: TrainProtocol, dataset: Dataset, run_id: str, log_save_dir: str, save: bool = False, test_run_calc:bool=False) -> str:
+        if self.spill_to_disk and train_protocol == TrainProtocol.FedAttract:
+            self.global_cluster.swap_to_disk_checkpoint_recursive()
 
         dataset_ref = dataset
         batch_size = config.BATCH_SIZE
@@ -120,8 +257,12 @@ class Server:
         ALIE_clients = [c for c in self.clients if c.atack_type == ClientTypes.ALIE]
 
         for round_id in range(1, config.ROUNDS+1):
-            if len(ALIE_clients) != 0:
-                ALIEAttack.global_model_state = topology.Cluster.avg_model_states([(c.cid, c.model_state) for c in self.clients])  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
+            if len(self.ALIE_clients) != 0:
+                ALIEAttack.global_model_state = topology.Cluster.avg_model_states([(c.cid, c.get_model_state()) for c in self.clients])  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
+            if len(self.IPM_clients) != 0:
+                IPMAttack.global_model_state = topology.Cluster.avg_model_states(
+                    [(c.cid, c.get_model_state()) for c in self.clients if c.attack is None]
+                )
 
             log.info(f"{round_id}/{config.ROUNDS}: ", extra={"save": True})
             if train_protocol == TrainProtocol.FedAttract:
@@ -196,16 +337,24 @@ class Server:
             if train_protocol == TrainProtocol.FedAttract:
                 self.global_cluster.save_metadata(log_save_dir, "topology")
 
+            if ClientTypes.LABEL_SWITCH in self.client_types.keys():
+                with open(f"{log_save_dir}/label_switch.json", "w") as f:
+                    import json
+                    json.dump(LabelSwitchAttack.label_switch, f)
+
+        if self.spill_to_disk:
+            self.global_cluster.clean_checkpoints()
+
         return log_save_dir
 
     def round_fed_attract(
             self, 
-            round_id, 
-            run_id, 
+            round_id: int, 
+            run_id: str, 
             dataset_ref: Dataset, 
-            batch_size, 
+            batch_size: int, 
             post_update_attack_clients: list[client.Client],
-            device, 
+            device: str, 
             test_run_calc:bool=False
         ) -> tuple[tuple[float, float, float], list[float], int, int]:
         bigo_t = 0
@@ -214,9 +363,17 @@ class Server:
             m = int(len(self.clients) * config.CLIENT_FRAC)
             selected = random.sample(self.clients, m)
 
+            if self.spill_to_disk:
+                self.switch_clients_to_memory()
+            log.info(f"Clients in memory AFTER switching to memory costs {find_size(self.clients)} MB")
+            log.info(f"Switching to memory worked? {all(c.model_state is not None for c in self.clients)}")
+
             train_start = time.time()
             futures = [c.train(dataset_ref, batch_size, device, round_id) for c in selected]
             local_sds__cid = ray.get(futures)
+
+            train_end = time.time()
+            old_models = {}
 
             for sd, cid in local_sds__cid:
                 self.clients[cid].model_state = sd[0]
@@ -240,20 +397,27 @@ class Server:
 
         alg_start = time.time()
         if round_id % config.ATTRACT_SPLIT_EVERY == 0:
-            bigo_t += self.global_cluster.split()
+            bigo_t += self.global_cluster.split(self.W, self.W_flat)
 
-        bigo_t += self.global_cluster.update_centers_upward(updated_states, use_softmax=False)
-        bigo_s += self.global_cluster.propagate_downward()
-        bigo_s_, bigo_t_ = self.global_cluster.propagate_downward(recalc_dists=False)
+        bigo_t += self.global_cluster.update_centers_upward(self.W, self.W_flat)
+        bigo_s_, bigo_t_ = self.global_cluster.propagate_downward(recalc_dists=False, bigo_W_size=self.W, bigo_W_flat_size=self.W_flat)
         bigo_s += bigo_s_
         bigo_t += bigo_t_
         alg_end = time.time()
 
+        time.sleep(10)
+        log.info(f"Clients in memory AFTER switching to disk costs {find_size(self.clients)} MB")
+        log.info(f"Switching to disk worked? {all(c.model_state is None for c in self.clients)}")
+
         if not test_run_calc:
             log.info("Finished training. Starting Eval")
+            if self.spill_to_disk:
+                self.switch_clients_to_memory()
             acc_start = time.time()
             accs = ray.get([c.evaluate(dataset_ref, batch_size, device) for c in self.clients if c.client_type == client.ClientTypes.NORMAL]) # list[tuple[float, client_id#int]]
             acc_end = time.time()
+            if self.spill_to_disk:
+                self.switch_clients_to_disk()
 
             accs.sort(key=lambda x: x[1])
             # accs_, _, counters = zip(*accs)
@@ -298,7 +462,7 @@ class Server:
                 )
 
         alg_start = time.time()
-        new_global = topology.Cluster.avg_model_states([(c.cid, c.model_state) for c in self.clients])
+        new_global = topology.Cluster.avg_model_states([(c.cid, c.get_model_state()) for c in self.clients])
         alg_end = time.time()
 
         # start = time.time()
@@ -318,7 +482,10 @@ class Server:
 
         accs_lis = list(accs_)
 
-        return (train_end-train_start, alg_end-alg_start, acc_end-acc_start), accs_lis, m, 1
+        big_o_t = m
+        big_o_s = len(self.clients)*models.get_size()
+
+        return (train_end-train_start, alg_end-alg_start, acc_end-acc_start), accs_lis, big_o_t, big_o_s
 
     # time_taken, client_accs, bigo_t, bigo_s    
     def round_fed_krum(
@@ -443,16 +610,19 @@ class Server:
                     for other_cid, other_d_flat in self.calibrated_update_pool.items():
                         if other_cid == cid or other_cid in self.detected_malicious:
                             continue
-                        bigo_t += 1
+
+                        bigo_t += self.W
 
                         sim = self._cosine_similarity_flat(d_k_flat, other_d_flat)
                         similarities[other_cid] = sim
 
                     # Compute aggregation weights with softmax normalization (Eq. 5)
+                    bigo_t += 2*len(similarities)
                     weights = self._compute_customized_weights(
                         cid, similarities, self.fedcap_alpha, self.fedcap_phi
                     )
-                    
+
+                    bigo_t += len(self.recovered_model_pool)*self.W
                     # Aggregate recovered models from previous round using weights (Eq. 3)
                     aggregated = self._aggregate_weighted_states(
                         self.recovered_model_pool, weights
@@ -462,11 +632,11 @@ class Server:
         # =========================================================================
         # STEP 3: Distribute and Local Training
         # =========================================================================
+        alg_pause = time.time()
+
         for c in selected:
             # Load customized model into client
             c.model_state = copy.deepcopy(customized_models[c.cid])
-        
-        alg_pause = time.time()
 
         if not test_run_calc:
             train_start = time.time()
@@ -485,7 +655,7 @@ class Server:
                         self.client_types[attack_client.atack_type]
                     )
 
-            local_results = [(c.model_state, c.cid) for c in self.clients]
+            local_results = [(c.get_model_state(), c.cid) for c in self.clients]
 
         alg_continue = time.time()
         
@@ -497,19 +667,21 @@ class Server:
         recovered_models = {}      # \tilde{w}_k^t
         calibrated_updates: dict[int, torch.Tensor] = {}    # Flattened \tilde{d}_k^t
 
-        if not test_run_calc:
-            for state_dict, cid in local_results: # pyright: ignore[reportPossiblyUnboundVariable]
-                # Recovery: the returned state is the recovered model
-                recovered_models[cid] = state_dict
+        # bigo_t += len(local_results) # pyright: ignore[reportPossiblyUnboundVariable]
+        # # calibrate updates
+        # if not test_run_calc:
+        #     for state_dict, cid in local_results: # pyright: ignore[reportPossiblyUnboundVariable]
+        #         # Recovery: the returned state is the recovered model
+        #         recovered_models[cid] = state_dict
                 
-                # Calibration: difference between recovered model and current global model
-                diff_state = self._state_diff(state_dict, self.global_model_state)
-                calibrated_updates[cid] = stats.flatten(diff_state) # pyright: ignore[reportArgumentType]
-        else:
-            for client_ in self.clients:
-                recovered_models[client_.cid] = client_.model_state
-                diff_state = self._state_diff(client_.model_state, self.global_model_state)
-                calibrated_updates[client_.cid] = stats.flatten(diff_state) # pyright: ignore[reportArgumentType]
+        #         # Calibration: difference between recovered model and current global model
+        #         diff_state = self._state_diff(state_dict, self.global_model_state)
+        #         calibrated_updates[cid] = stats.flatten(diff_state) # pyright: ignore[reportArgumentType]
+        # else:
+        #     for client_ in self.clients:
+        #         recovered_models[client_.cid] = client_.model_state
+        #         diff_state = self._state_diff(client_.get_model_state(), self.global_model_state)
+        #         calibrated_updates[client_.cid] = stats.flatten(diff_state) # pyright: ignore[reportArgumentType]
         # =========================================================================
         # STEP 5: Anomaly Detection (Section V-C)
         # Detect malicious clients by thresholding Euclidean norm of calibrated updates
@@ -519,20 +691,34 @@ class Server:
         avg_coord = torch.dot(avg, direction).item()
 
         log.info(f"\tGLOBAL: {avg_coord}")
-
         newly_detected = []
-        for cid, cal_flat in calibrated_updates.items():
-            if cid in self.detected_malicious:
-                continue
 
-            bigo_t += 1
-            norm = torch.norm(cal_flat).item()
-            if norm > self.fedcap_T_norm:
-                self.detected_malicious.add(cid)
-                newly_detected.append((cid, norm))
+        if not test_run_calc:
+            for state_dict, cid in local_results: # pyright: ignore[reportPossiblyUnboundVariable]
+                # Recovery: the returned state is the recovered model
+                recovered_models[cid] = state_dict
+                
+                # Calibration: difference between recovered model and current global model
+                bigo_t += 1
+                diff_state = self._state_diff(state_dict, self.global_model_state)
+                calibrated_updates[cid] = stats.flatten(diff_state) # pyright: ignore[reportArgumentType]
 
-            upd = cal_flat + avg
-            log.info(f"{cid=} {torch.dot(upd.flatten(), direction).item()} {norm=}")
+                if cid in self.detected_malicious:
+                    continue
+
+                bigo_t += calibrated_updates[cid].numel()
+                norm = torch.norm(calibrated_updates[cid]).item()
+                if norm > self.fedcap_T_norm:
+                    self.detected_malicious.add(cid)
+                    newly_detected.append((cid, norm))
+
+                upd = calibrated_updates[cid] + avg
+                log.info(f"{cid=} {torch.dot(upd.flatten(), direction).item()} {norm=}")
+        else:
+            for client_ in self.clients:
+                recovered_models[client_.cid] = client_.model_state
+                diff_state = self._state_diff(client_.get_model_state(), self.global_model_state)
+                calibrated_updates[client_.cid] = stats.flatten(diff_state) # pyright: ignore[reportArgumentType]
         
         if newly_detected:
             log.info(f"Round {round_id}: Detected and removed malicious clients: {newly_detected}  {len(newly_detected)=}", extra={"save": True})
@@ -570,7 +756,7 @@ class Server:
             # eval_results.sort(key=lambda x: x[1])
             accs, _, _ = zip(*eval_results)
 
-        bigo_s = len(self.calibrated_update_pool) + len(self.recovered_model_pool)
+        bigo_s = (len(self.calibrated_update_pool) + len(self.recovered_model_pool) + 1) * self.W
 
         if test_run_calc:
             return (0, (alg_end-alg_continue)+(alg_pause-alg_start), 0), [], bigo_t, bigo_s # pyright: ignore[reportPossiblyUnboundVariable]

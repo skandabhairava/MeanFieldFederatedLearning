@@ -58,3 +58,9 @@ def get_model():
     # return m
 
     return SimpleCNN()
+
+import functools
+@functools.lru_cache
+def get_size() -> int:
+    flat = stats.flatten(get_model().state_dict()) # pyright: ignore[reportArgumentType]
+    return len(flat)

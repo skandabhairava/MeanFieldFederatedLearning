@@ -65,10 +65,22 @@ def main(train_protocol: TrainProtocol, run_name: str, test_run_calc: bool=False
     model = models.get_model()
     log.debug("Model loaded.")
 
-    server = Server(model, types, client_splits, config.NUM_CLIENTS, config.RANDOM_SEED)
+    server = Server(
+        model, 
+        types, 
+        client_splits, 
+        config.NUM_CLIENTS,
+        spill_to_disk=False,
+        spill_folder="spill", 
+        seed=config.RANDOM_SEED
+    )
 
     log.info("Starting Training", extra={"save": True})
-    save_folder = server.train(train_protocol, combined_data, run_id, run_log_dir, save=True, test_run_calc=test_run_calc)
+    try:
+        save_folder = server.train(train_protocol, combined_data, run_id, run_log_dir, save=True, test_run_calc=test_run_calc)
+    except KeyboardInterrupt:
+        server.global_cluster.clean_checkpoints()
+        raise
 
     if config.WRITE_LOGS and not test_run_calc:
         with open(f"{save_folder}/metadata.npy", "wb") as f:
@@ -95,7 +107,16 @@ def test_backdoor(folder_name):
             client_saves.append(torch.load(f))
 
     clients = [
-        client.Client(i, client_splits, lambda x:x, client_saves[i], ClientTypes.BACKDOOR_0_ALL, save_log=False, seed=config.RANDOM_SEED) # pyright: ignore[reportArgumentType]
+        client.Client(
+            i, 
+            client_splits, 
+            lambda x:x, 
+            client_saves[i], 
+            "spill",
+            ClientTypes.BACKDOOR_0_ALL, 
+            save_log=False, 
+            seed=config.RANDOM_SEED
+        ) # pyright: ignore[reportArgumentType]
         for i in range(len(client_saves))
     ]
 

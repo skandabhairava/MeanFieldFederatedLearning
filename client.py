@@ -27,6 +27,7 @@ class Client:
             splits: list[ClientSplit], 
             proj_func: Callable[[torch.Tensor], torch.Tensor], 
             model_state: models.StateDict, 
+            spill_folder: str,
             client_type: ClientTypes=ClientTypes.NORMAL, 
             save_log: bool = True,
             verifying_so_remove_splits: bool = False,
@@ -36,12 +37,16 @@ class Client:
         self.split = ([], []) if verifying_so_remove_splits else splits[cid]
         self.client_type: ClientTypes = client_type
         # self.model_state: StateDictPtr = StateDictPtr(model_state, project_func)
-        self.model_state = copy.deepcopy(model_state)
-        self.model_state_flattened = proj_func(stats.flatten(self.model_state))
+        self.model_state: None|models.StateDict = copy.deepcopy(model_state)
+        self.model_state_flattened: None|torch.Tensor = proj_func(stats.flatten(self.model_state))
+        # self.disp = proj_func(stats.flatten(self.model_state), disp=True) # pyright: ignore[reportCallIssue]
+        self.in_memory_swapped: bool = True
+
         self.save_path = f"{self.cid}_model.pth"
 
+        self.spill_folder = spill_folder
+
         self.attack: attacks.Attack|None = None
-        self.atack_type = client_type
 
         if client_type == ClientTypes.SUBTLE:
             self.attack = attacks.SubtleAttack("subtle")
@@ -57,6 +62,41 @@ class Client:
         if save_log:
             log.info(f"Client {self.cid} has been assigned type: {client_type}", extra={"save": True})
 
+    def __repr__(self) -> str:
+        return f"[{self.cid}: {self.client_type}]"
+
+    def get_model_state(self) -> models.StateDict:
+        if self.model_state is None:
+            with open(f"{self.spill_folder}/{self.cid}.chkp", "rb") as f:
+                state = torch.load(f)
+        else:
+            state = self.model_state
+        return state
+
+    def get_model_state_flattened(self) -> torch.Tensor:
+        if self.model_state_flattened is None:
+            with open(f"{self.spill_folder}/f{self.cid}.chkp", "rb") as f:
+                state = torch.load(f)
+        else:
+            state = self.model_state_flattened
+        return state
+
+    def save_model_state(self):
+        if self.model_state is not None:
+            with open(f"{self.spill_folder}/{self.cid}.chkp", "wb") as f:
+                torch.save(self.model_state, f)
+    
+    def save_model_state_flattened(self):
+        if self.model_state_flattened is not None:
+            with open(f"{self.spill_folder}/f{self.cid}.chkp", "wb") as f:
+                torch.save(self.model_state_flattened, f)
+
+    def clean_checkpoints(self):
+        if os.path.exists(f"{self.spill_folder}/{self.cid}.chkp"):
+            os.remove(f"{self.spill_folder}/{self.cid}.chkp")
+        if os.path.exists(f"{self.spill_folder}/f{self.cid}.chkp"):
+            os.remove(f"{self.spill_folder}/f{self.cid}.chkp")
+
     def train(self, dataset: Dataset, batch_size, device, round_id: int):
         # return train.remote(self.model_state.state_dict, self.split, dataset, batch_size, device, self.attack, self.cid)
         return train.remote(self.model_state, self.split, dataset, batch_size, device, self.attack, self.cid, round_id)
@@ -64,8 +104,8 @@ class Client:
     def evaluate(self, dataset: Dataset, batch_size, device, should_attack: bool=False, calc_counts: bool=False):
         # return evaluate.remote(self.model_state.state_dict, self.split, dataset, batch_size, device, self.cid)
         return evaluate.remote(
-            self.model_state, 
-            self.split, 
+            self.get_model_state(), 
+            split, 
             dataset, 
             batch_size, 
             device, 
@@ -76,7 +116,7 @@ class Client:
 
     def save(self, log_save_dir: str):
         with open(f"{log_save_dir}/{self.save_path}", "wb") as f:
-            torch.save(self.model_state, f)
+            torch.save(self.get_model_state(), f)
 
     def _build_cluster_metadata_tree(self):
         return {
