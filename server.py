@@ -23,6 +23,8 @@ from attacks import ALIEAttack, IPMAttack, LabelSwitchAttack
 
 import copy
 import math
+import models
+import gui
 
 ModelState = tuple[models.StateDict, int]
 
@@ -66,6 +68,9 @@ class TrainProtocol(Enum):
     FedAvg = 2
     FedKrum = 3
     FedCap = 4
+    FedCFL = 5
+    FedClippedCFL = 6
+    Local = 7
 
 class Server:
     def __init__(
@@ -308,6 +313,15 @@ class Server:
                     device, 
                     test_run_calc
                 )
+            elif train_protocol == TrainProtocol.Local:
+                time_taken, client_accs, bigo_t, bigo_s = self.round_local_only(
+                    round_id, 
+                    run_id, 
+                    dataset_ref, 
+                    batch_size, 
+                    self.ALIE_clients[:1] + self.IPM_clients[:1],
+                    device
+                )
             elif train_protocol == TrainProtocol.FedAvg:
                 time_taken, client_accs, bigo_t, bigo_s = self.round_fed_avg(
                     round_id, 
@@ -336,6 +350,25 @@ class Server:
                     device, 
                     test_run_calc
                 )
+            elif train_protocol == TrainProtocol.FedCFL:
+                time_taken, client_accs, bigo_t, bigo_s = self.round_fed_cfl(
+                    round_id, 
+                    run_id, 
+                    dataset_ref, 
+                    batch_size, 
+                    self.ALIE_clients[:1] + self.IPM_clients[:1],
+                    device,
+                )
+            elif train_protocol == TrainProtocol.FedClippedCFL:
+                time_taken, client_accs, bigo_t, bigo_s = self.round_fed_cfl(
+                    round_id, 
+                    run_id, 
+                    dataset_ref, 
+                    batch_size, 
+                    self.ALIE_clients[:1] + self.IPM_clients[:1],
+                    device,
+                    clip=True
+                )
 
             if not test_run_calc:
                 log.info(f"Time taken to train: {time_taken[0]}s, accuracy: {time_taken[2]}", extra={"save": True})
@@ -348,10 +381,13 @@ class Server:
                 acc = stats.avg(client_accs)
                 log.info(f"\tAccuracy: {acc*100:.2f}% | {len(client_accs)} total clients evaluated.", extra={"save": True})
 
-            self.global_cluster.print_tree()
-
-            # if len(ALIE_clients) != 0:
-            #     ALIEAttack.perform_general_post_update_attack(self.clients)  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
+            self.global_cluster.print_tree(save_info=True)
+            log.info(f"Protocol: {train_protocol}")
+            if train_protocol == TrainProtocol.FedCFL or train_protocol == TrainProtocol.FedClippedCFL:
+                log.info(f"Clusters size: {len(self.cfl_clusters)}")
+                for c in self.cfl_clusters:
+                    log.info(f"Cluster {c.cid}:", extra={"save": True})
+                    log.info(f"\t{[f'{m.cid} | {m.client_type}' for m in c.members.values()]}", extra={"save": True}) # pyright: ignore[reportAttributeAccessIssue]
 
             if not test_run_calc:
                 if round_id % 10 == 0 and round_id != config.ROUNDS:
@@ -392,6 +428,11 @@ class Server:
         ) -> tuple[tuple[float, float, float], list[float], int, int]:
         bigo_t = 0
         bigo_s = 0
+
+        if getattr(self, "norm_client", None) is None:
+            self.norm_client = random.choice(self.HONEST_clients)
+            log.info(f"Selecting client {self.norm_client.cid} as the clipping limit", extra={"save": True})
+
         if not test_run_calc:
             m = int(len(self.clients) * config.CLIENT_FRAC)
             selected = random.sample(self.clients, m)
@@ -409,6 +450,7 @@ class Server:
             old_models = {}
 
             for sd, cid in local_sds__cid:
+                old_models[cid] = self.clients[cid].get_model_state()
                 self.clients[cid].model_state = sd[0]
                 self.clients[cid].model_state_flattened = self.project(
                     stats.flatten(sd[0]),
@@ -463,6 +505,57 @@ class Server:
         if test_run_calc:
             return (0, alg_end-alg_start, 0), [], bigo_t, bigo_s
         return (train_end-train_start, alg_end-alg_start, acc_end-acc_start), accs_lis, bigo_t, bigo_s # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
+
+    def round_local_only(
+            self, 
+            round_id, 
+            run_id, 
+            dataset_ref: Dataset, 
+            batch_size, 
+            post_update_attack_clients: list[client.Client],
+            device
+        ) -> tuple[tuple[float, float, float], list[float], int, int]:
+        m = int(len(self.clients) * config.CLIENT_FRAC)
+        selected = random.sample(self.clients, m)
+
+        train_start = time.time()
+        futures = [c.train(dataset_ref, batch_size, device, round_id) for c in selected]
+        local_sds__cid = ray.get(futures)
+        train_end = time.time()
+
+        for (state, _), cid in local_sds__cid:
+            self.clients[cid].model_state = state
+
+        for attack_client in post_update_attack_clients:
+            if attack_client.attack is not None:
+                attack_client.attack.perform_general_post_update_attack(
+                    self.clients,
+                    len(self.clients),
+                    self.client_types[attack_client.client_type],
+                    round_id
+                )
+
+        dic: dict[int, tuple[None|str, bool, tuple[float, float]]] = {}
+        self.global_cluster.get_2dpos(dic)
+
+        gui.queue.put([(i[2], i[0], i[1]) for i in dic.values()])
+        del dic
+
+        log.info("Finished training. Starting Eval")
+
+        acc_start = time.time()
+        accs = ray.get([c.evaluate(dataset_ref, batch_size, device) for c in self.clients if c.client_type == client.ClientTypes.NORMAL]) # list[tuple[float, client_id#int]]
+        acc_end = time.time()
+        
+        accs_, _, _, _ = zip(*accs)
+
+        accs_lis = list(accs_)
+
+        big_o_t = m
+        big_o_s = 0#len(self.clients)*models.get_size()
+
+        return (train_end-train_start, 0.0, acc_end-acc_start), accs_lis, big_o_t, big_o_s
+    
 
     def round_fed_avg(
             self, 
@@ -549,7 +642,7 @@ class Server:
                 )
 
         alg_start = time.time()
-        new_global = comparision_algorithms.krum_aggregate_adaptive([(c.cid, c.model_state) for c in self.clients])
+        client_sel, new_global = comparision_algorithms.krum_aggregate_adaptive([(c.cid, c.get_model_state()) for c in self.clients])
         alg_end = time.time()
 
         log.info(f"Client Selected Krum: {client_sel} | {self.clients[client_sel].client_type if client_sel >= 0 else 'median selected'}")
@@ -797,6 +890,162 @@ class Server:
             return (0, (alg_end-alg_continue)+(alg_pause-alg_start), 0), [], bigo_t, bigo_s # pyright: ignore[reportPossiblyUnboundVariable]
         return (train_end-train_start, (alg_end-alg_continue)+(alg_pause-alg_start), acc_end-acc_start), list(accs), bigo_t, bigo_s # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
 
+    def round_fed_cfl(
+        self,
+        round_id,
+        run_id,
+        dataset_ref: Dataset,
+        batch_size,
+        post_update_attack_clients: list[client.Client],
+        device,
+        clip: bool=False
+    ) -> tuple[tuple[float, float, float], list[float], int, int]:
+        eps = getattr(config, "CFL_EPS", -0.1)            # paper: eps = -0.1
+        eps_int = getattr(config, "CFL_EPS_INT", 10)      # paper: eps_int = 10
+
+        # CFL requires full participation (Alg. 1 needs all pairwise similarities)
+        m = len(self.clients)
+
+        if getattr(self, "cfl_clusters", None) is None or len(self.cfl_clusters) == 0:
+            self.cfl_clusters: list[topology.Cluster] = [self.global_cluster]
+
+        cid_to_client = {c.cid: c for c in self.clients}
+
+        # broadcast: each client starts from its cluster center
+        for cluster in self.cfl_clusters:
+            if cluster.model_state is not None:
+                for c in cluster.members.values():
+                    c.model_state = cluster.model_state
+
+        # ---- local training (Alg. 1, l. 6-8): all N clients ---------------
+        train_start = time.time()
+        futures = [c.train(dataset_ref, batch_size, device, round_id) for c in self.clients]
+        local_sds__cid = ray.get(futures)
+        train_end = time.time()
+
+        old_models = {}
+        for (state, _), cid in local_sds__cid:
+            old_models[cid] = self.clients[cid].get_model_state()
+            self.clients[cid].model_state = state
+
+        for attack_client in post_update_attack_clients:
+            if attack_client.attack is not None:
+                attack_client.attack.perform_general_post_update_attack(
+                    self.clients,
+                    len(self.clients),
+                    self.client_types[attack_client.client_type],
+                    round_id
+                )
+
+        alg_start = time.time()
+
+        if clip:
+            norm_client = random.choice(self.HONEST_clients)
+            max_norm = Server.get_norm(norm_client.get_model_state(), old_models[norm_client.cid])
+            for c in self.clients:
+                Server.clip_state_dict_distance(c.get_model_state(), old_models[c.cid], max_norm)
+
+            print("clipped")
+
+        dic: dict[int, tuple[None|str, bool, tuple[float, float]]] = {}
+        for c in self.cfl_clusters:
+            c.get_2dpos(dic)
+
+        gui.queue.put([(i[2], i[0], i[1]) for i in dic.values()])
+        del dic
+
+        # Extra server computation, accumulated in units of |w|-sized vector
+        # ops (+ N_c^3 flops per eigendecomposition). See big_o_t below.
+        extra_compute = 0
+
+        # splits are impossible before eps_int rounds (Alg. 1, l. 12), so the
+        # O(N^2 |w|) overhead is skipped entirely before that -> CFL is then
+        # cost-identical to full-participation FedAvg.
+        split_check_round = round_id >= eps_int
+
+        sim, row_of = None, None
+        if split_check_round and any(len(cl.members) > 1 for cl in self.cfl_clusters):
+            # dW_i = w_i - w_{cluster(i)}   (Alg. 1, l. 9)  -> N vector ops
+            update_vecs: dict[int, torch.Tensor] = {}
+            for cluster in self.cfl_clusters:
+                center_vec = stats.flatten(cluster.get_model_state())
+                for c in cluster.members.values():
+                    update_vecs[c.cid] = stats.flatten(c.get_model_state()) - center_vec
+            extra_compute += m * self.W
+
+            # M_ij = cos(dW_i, dW_j)       (Eq. (10))      -> N^2 dot products
+            cids = [c.cid for c in self.clients]
+            updates = torch.stack([update_vecs[cid] for cid in cids])
+            norms = torch.norm(updates, dim=1).clamp_min(1e-12)
+            sim = ((updates @ updates.T) / (torch.outer(norms, norms) + 1e-12)).detach().cpu().numpy()
+            row_of = {cid: i for i, cid in enumerate(cids)}
+            extra_compute += m * m * self.W
+
+        # split check + PartitionCluster (Alg. 1, l. 12-13)
+        new_clusters: list[topology.Cluster] = []
+        for cluster in self.cfl_clusters:
+            member_cids = list(cluster.members.keys())
+
+            do_split, sub = False, None
+            if split_check_round and sim is not None and len(member_cids) > 1:
+                idx = [row_of[cid] for cid in member_cids] # pyright: ignore[reportOptionalSubscript]
+                sub = sim[np.ix_(idx, idx)]
+                sub = 0.5 * (sub + sub.T)                  # enforce symmetry
+                crit = sub.copy()
+                np.fill_diagonal(crit, 1.0)                # ignore self-similarity
+                do_split = float(crit.min()) < eps         # Eq. (11)
+
+            if do_split:
+                p1, p2 = Server._fiedler_bipartition(sub, member_cids) # pyright: ignore[reportArgumentType]
+                log.info(f"[CFL][run {run_id}] round {round_id}: split cluster "
+                         f"of {len(member_cids)} clients -> {len(p1)} / {len(p2)}")
+                # eigendecomposition of the N_c x N_c similarity matrix: O(N_c^3)
+                extra_compute += len(member_cids) ** 3
+                for part in (p1, p2):
+                    new_clusters.append(self._make_cluster(part, cid_to_client, parent=cluster))
+            else:
+                new_clusters.append(cluster)
+        self.cfl_clusters = new_clusters
+
+        # per-cluster aggregation (Alg. 1, l. 14-15)
+        for cluster in self.cfl_clusters:
+            center = topology.Cluster.avg_model_states(
+                [(c.cid, c.get_model_state()) for c in cluster.members.values()]
+            )
+            cluster.model_state = center
+
+            for c in cluster.members.values():
+                c.model_state = center
+
+        alg_end = time.time()
+
+        log.info("Finished training. Starting Eval")
+
+        acc_start = time.time()
+        accs = ray.get([c.evaluate(dataset_ref, batch_size, device) for c in self.clients if c.client_type == client.ClientTypes.NORMAL])
+        acc_end = time.time()
+
+        accs_, _, _, _ = zip(*accs)
+        accs_lis = list(accs_)
+
+        # ---------------- complexity labels ----------------
+        num_clusters = len(self.cfl_clusters)          # = 1 + (splits so far)
+
+        # Per-round computation:
+        #   FedAvg baseline: m trainings (m = N here, full participation)
+        #   + m      update computations  dW_i          (check rounds only)
+        #   + m^2    cosine-similarity matrix          (check rounds only)
+        #   + N_c^3  per eigen-decomposition           (split rounds only,
+        #             <= N-1 splits over the whole run)
+        big_o_t = m * self.W + extra_compute
+
+        # Per-round model-state footprint (units of |w|):
+        #   FedAvg baseline: N client states (global model uncounted, as in
+        #   round_fed_avg) + one EXTRA stored cluster center per split
+        big_o_s = (len(self.clients) + (num_clusters)) * self.W
+
+        return (train_end - train_start, alg_end - alg_start, acc_end - acc_start), accs_lis, big_o_t, big_o_s
+
 
     # =============================================================================
     # Helper Methods (add these to the Server class)
@@ -867,3 +1116,41 @@ class Server:
     def _state_diff(self, state1: models.StateDict, state2: models.StateDict) -> dict:
         """Element-wise difference between two state dicts (state1 - state2)."""
         return {k: state1[k] - state2[k] for k in state1}
+
+    # ------------------------------------------------------------------ #
+    #                        CFL helpers                                 #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _fiedler_bipartition(sim: np.ndarray, member_cids: list[int]) -> tuple[list[int], list[int]]:
+        """
+        PartitionCluster (paper Sec. IV): spectral bi-partitioning of a
+        cluster using the Fiedler vector, i.e. the eigenvector belonging to
+        the second-smallest eigenvalue of the cluster's cosine similarity
+        matrix. Clients are assigned according to the sign of their entry.
+        """
+        eigvals, eigvecs = np.linalg.eigh(sim)      # ascending eigenvalues
+        fiedler = eigvecs[:, 1].real                # pyright: ignore[reportAttributeAccessIssue] # 2nd smallest eigenvalue
+        part_neg = [cid for cid, v in zip(member_cids, fiedler) if v < 0.0]
+        part_pos = [cid for cid, v in zip(member_cids, fiedler) if v >= 0.0]
+
+        if not part_neg or not part_pos:
+            # degenerate (all entries same sign): order clients along the
+            # Fiedler vector and cut at the largest gap -> non-trivial split
+            order = np.argsort(fiedler)
+            gaps = np.diff(fiedler[order])
+            cut = int(np.argmax(gaps)) + 1
+            part_neg = [member_cids[i] for i in order[:cut]]
+            part_pos = [member_cids[i] for i in order[cut:]]
+
+        return part_neg, part_pos
+
+    def _make_cluster(self, member_cids: list[int], cid_to_client: dict, parent) -> topology.Cluster:
+        """Create a new Cluster node; its center is the average of its members."""
+        members = {cid: cid_to_client[cid] for cid in member_cids}
+        return topology.Cluster(
+            members,
+            self.dist_func,
+            self.project,
+            self.spill_folder,
+            parent=parent,
+        )

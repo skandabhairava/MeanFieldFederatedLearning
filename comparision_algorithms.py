@@ -4,11 +4,12 @@ import models
 
 import logging as log
 import stats
+import models
 
 def krum_aggregate_adaptive(
     client_states: Sequence[tuple[int, models.StateDict]],
     num_byzantine: int | None = None,
-) -> models.StateDict:
+) -> tuple[int, models.StateDict]:
     n = len(client_states)
     
     # Handle trivial cases early
@@ -44,7 +45,7 @@ def krum_aggregate_adaptive(
     
     # Compute pairwise Euclidean distances (efficient, vectorized)
     # Using torch.cdist – much faster than nested loops
-    dist_matrix = torch.cdist(vectors, vectors, p=2)  # shape (n, n)
+    dist_matrix = torch.cdist(vectors, vectors, p=2).square()  # shape (n, n)
     
     # Compute Krum scores
     scores = []
@@ -54,14 +55,14 @@ def krum_aggregate_adaptive(
         scores.append(sorted_dists.sum())
     
     best_idx = int(torch.argmin(torch.tensor(scores)).item())
-    return client_states[best_idx][1]
+    return client_states[best_idx]
 
-def coordinate_wise_median(client_states) -> models.StateDict:
+def coordinate_wise_median(client_states: Sequence[tuple[int, models.StateDict]]) -> tuple[int, models.StateDict]:
     """Fallback aggregation when Krum assumptions can't be met."""
     states = [state for _, state in client_states]
-    agg_state = {}
+    agg_state: models.StateDict = {} # pyright: ignore[reportAssignmentType]
     for key in states[0].keys():
         stacked = torch.stack([s[key] for s in states])
         median_vals, _ = torch.median(stacked, dim=0)
         agg_state[key] = median_vals
-    return agg_state # pyright: ignore[reportReturnType]
+    return -1, agg_state

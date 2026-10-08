@@ -60,7 +60,7 @@ def main(train_protocol: TrainProtocol, run_name: str, test_run_calc: bool=False
 
     types = Client.sample_types(config.NUM_CLIENTS, config.CLIENT_TYPES)
 
-    log.info(f"Sampled clients: {Counter(types)}")
+    log.info(f"Sampled clients: {Counter(types)}", extra={'save': True})
 
     model = models.get_model()
     log.debug("Model loaded.")
@@ -140,7 +140,7 @@ def test_backdoor(folder_name):
     del device
 
     accs.sort(key=lambda x: x[1])
-    accs_, cids, counters = zip(*accs)
+    accs_, cids, counters, _ = zip(*accs)
 
     accs_lis = list(accs_)
 
@@ -625,19 +625,230 @@ def evaluate_entropy(folder_name):
     print(score)
 
 if __name__ == "__main__":
-    # folder_to_test = "RUN_Tue_Aug__4_14-21-24_2026_backdoor_fedattract_pathalogical_diff_test_scaled"
-    # folder_to_test = "RUN_Fri_Jul_31_22-02-39_2026_backdoor_fedattract_pathalogical"
-    # folder_to_test = "RUN_Tue_Aug__4_12-09-36_2026_backdoor_fedattract_pathalogical_diff_test"
+    # gui__ = Process(
+    #     target=gui.gui_process,
+    #     args=(gui.queue,),
+    #     daemon=True,
+    # )
 
-    # folder_to_test = "RUN_Sat_Jul_25_16-19-27_2026_backdoor_pathalogical_cap"
-    # folder_to_test = "RUN_Sat_Jul_25_18-36-25_2026_backdoor_avg"
+    # gui__.start()
 
-    main(
-        TrainProtocol.FedCap,
-        "alie30_fedcap_pathalogical", 
-        test_run_calc=False,
-        data_distribution=DataDistribution.Pathological
-    )
+    import sys
+    if len(sys.argv) < 1:
+        exit()
+
+    if sys.argv[0] == "0":
+        config.CLIENT_TYPES = {
+            ClientTypes.NORMAL: 1.0,
+
+            # ClientTypes.NORMAL: 0.4,
+            # ClientTypes.MODEL_REPLACE_POS: 0.6,
+
+            # ClientTypes.NORMAL: 0.4,
+            # ClientTypes.BACKDOOR_0: 0.6,
+
+            # ClientTypes.NORMAL: 0.4,
+            # ClientTypes.LABEL_SWITCH: 0.6,
+
+            # ClientTypes.NORMAL: 0.4,
+            # ClientTypes.IPM: 0.6,
+
+            # ClientTypes.NORMAL: 0.4,
+            # ClientTypes.RANDOM: 0.6,
+
+            # ClientTypes.NORMAL: 0.4,
+            # ClientTypes.SIGN_FLIP: 0.6
+        }
+        main(
+            TrainProtocol.FedAttract,
+            "normal_fedattract_pathalogical", 
+            test_run_calc=False,
+            data_distribution=DataDistribution.Pathological
+        )
+    elif sys.argv[0] == "1":
+        config.CLIENT_TYPES = {
+            ClientTypes.NORMAL: 0.4,
+            ClientTypes.MODEL_REPLACE_POS: 0.6,
+        }
+        main(
+            TrainProtocol.FedAttract,
+            "modelreplace60_fedattract_pathalogical", 
+            test_run_calc=False,
+            data_distribution=DataDistribution.Pathological
+        )
+    elif sys.argv[0] == "2":
+        config.CLIENT_TYPES = {
+            ClientTypes.NORMAL: 0.4,
+            ClientTypes.IPM: 0.6,
+        }
+        main(
+            TrainProtocol.FedAttract,
+            "ipm60_fedattract_pathalogical",
+            test_run_calc=False,
+            data_distribution=DataDistribution.Pathological
+        )
+    elif sys.argv[0] == "3":
+        config.CLIENT_TYPES = {
+            ClientTypes.NORMAL: 0.4,
+            ClientTypes.ALIE: 0.6,
+        }
+        main(
+            TrainProtocol.FedAttract,
+            "alie60_fedattract_pathalogical",
+            test_run_calc=False,
+            data_distribution=DataDistribution.Pathological
+        )
+    elif sys.argv[0] == "4":
+        config.CLIENT_TYPES = {
+            ClientTypes.NORMAL: 0.4,
+            ClientTypes.RANDOM: 0.6,
+        }
+        main(
+            TrainProtocol.FedAttract,
+            "random60_fedattract_pathalogical",
+            test_run_calc=False,
+            data_distribution=DataDistribution.Pathological
+        )
+    elif sys.argv[0] == "5":
+        config.CLIENT_TYPES = {
+            ClientTypes.NORMAL: 0.4,
+            ClientTypes.SIGN_FLIP: 0.6,
+        }
+        main(
+            TrainProtocol.FedAttract,
+            "signflip60_fedattract_pathalogical",
+            test_run_calc=False,
+            data_distribution=DataDistribution.Pathological
+        )
+    elif sys.argv[0] == "6":
+        config.CLIENT_TYPES = {
+            ClientTypes.NORMAL: 0.4,
+            ClientTypes.BACKDOOR_0: 0.6,
+        }
+        main(
+            TrainProtocol.FedAttract,
+            "backdoor060_fedattract_pathalogical",
+            test_run_calc=False,
+            data_distribution=DataDistribution.Pathological
+        )
+    elif sys.argv[0] == "7":
+        config.CLIENT_TYPES = {
+            ClientTypes.NORMAL: 0.4,
+            ClientTypes.SUBTLE: 0.6,
+        }
+        main(
+            TrainProtocol.FedAttract,
+            "subtle60_fedattract_pathalogical",
+            test_run_calc=False,
+            data_distribution=DataDistribution.Pathological
+        )
+    elif sys.argv[0] == "8":
+        config.CLIENT_TYPES = {
+            ClientTypes.NORMAL: 0.4,
+            ClientTypes.LABEL_SWITCH: 0.6,
+        }
+        main(
+            TrainProtocol.FedAttract,
+            "labelswitch60_fedattract_pathalogical",
+            test_run_calc=False,
+            data_distribution=DataDistribution.Pathological
+        )
+
+    elif sys.argv[0] == "9":
+        config.CLIENT_TYPES = {
+            ClientTypes.NORMAL: 0.2,
+            ClientTypes.MODEL_REPLACE_POS: 0.8,
+        }
+        main(
+            TrainProtocol.FedAttract,
+            "modelreplace80_fedattract_pathalogical", 
+            test_run_calc=False,
+            data_distribution=DataDistribution.Pathological
+        )
+    elif sys.argv[0] == "10":
+        config.CLIENT_TYPES = {
+            ClientTypes.NORMAL: 0.2,
+            ClientTypes.IPM: 0.8,
+        }
+        main(
+            TrainProtocol.FedAttract,
+            "ipm80_fedattract_pathalogical",
+            test_run_calc=False,
+            data_distribution=DataDistribution.Pathological
+        )
+    elif sys.argv[0] == "11":
+        config.CLIENT_TYPES = {
+            ClientTypes.NORMAL: 0.2,
+            ClientTypes.ALIE: 0.8,
+        }
+        main(
+            TrainProtocol.FedAttract,
+            "alie80_fedattract_pathalogical",
+            test_run_calc=False,
+            data_distribution=DataDistribution.Pathological
+        )
+    elif sys.argv[0] == "12":
+        config.CLIENT_TYPES = {
+            ClientTypes.NORMAL: 0.2,
+            ClientTypes.RANDOM: 0.8,
+        }
+        main(
+            TrainProtocol.FedAttract,
+            "random80_fedattract_pathalogical",
+            test_run_calc=False,
+            data_distribution=DataDistribution.Pathological
+        )
+    elif sys.argv[0] == "13":
+        config.CLIENT_TYPES = {
+            ClientTypes.NORMAL: 0.2,
+            ClientTypes.SIGN_FLIP: 0.8,
+        }
+        main(
+            TrainProtocol.FedAttract,
+            "signflip80_fedattract_pathalogical",
+            test_run_calc=False,
+            data_distribution=DataDistribution.Pathological
+        )
+    elif sys.argv[0] == "14":
+        config.CLIENT_TYPES = {
+            ClientTypes.NORMAL: 0.2,
+            ClientTypes.BACKDOOR_0: 0.8,
+        }
+        main(
+            TrainProtocol.FedAttract,
+            "backdoor080_fedattract_pathalogical",
+            test_run_calc=False,
+            data_distribution=DataDistribution.Pathological
+        )
+    elif sys.argv[0] == "15":
+        config.CLIENT_TYPES = {
+            ClientTypes.NORMAL: 0.2,
+            ClientTypes.SUBTLE: 0.8,
+        }
+        main(
+            TrainProtocol.FedAttract,
+            "subtle80_fedattract_pathalogical",
+            test_run_calc=False,
+            data_distribution=DataDistribution.Pathological
+        )
+    elif sys.argv[0] == "16":
+        config.CLIENT_TYPES = {
+            ClientTypes.NORMAL: 0.2,
+            ClientTypes.LABEL_SWITCH: 0.8,
+        }
+        main(
+            TrainProtocol.FedAttract,
+            "labelswitch80_fedattract_pathalogical",
+            test_run_calc=False,
+            data_distribution=DataDistribution.Pathological
+        )
+    # run_generalize("RUN_Tue_Oct__6_16-07-32_2026_signflip60_fedcap_pathalogical", DataDistribution.Pathological)
+    # generalize_test("RUN_Mon_Oct__5_13-38-29_2026_signflip60_fedclipcfl_pathalogical")
+    # generalize_test("RUN_Mon_Oct__5_01-09-14_2026_signflip60_fedattract_pathalogical")
+    # generalize_test("RUN_Tue_Oct__6_16-07-32_2026_signflip60_fedcap_pathalogical")
+    # generalize_test("RUN_Mon_Oct__5_18-14-36_2026_signflip60_fedattract_pathalogical_50rounds")
+
+    # test_labelswitch("RUN_Sun_Oct__4_17-05-19_2026_labelswitch60_fedattract_pathalogical_clip3_norecalc")
     # test_backdoor(folder_to_test)
     # blind_test_backdoor(folder_to_test)
     # blind_test_backdoor_topology(foslder_to_test)
